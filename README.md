@@ -237,7 +237,7 @@ All 30 runtimes, compilers, and packages are defined declaratively in [`language
 ### Out-of-the-Box Supported Languages (Top 30):
 * **Systems & Low-Level**: Rust (2024), C (C17/GCC 14), C++ (C++20), Go (1.24), Zig (0.14), Nim, D (DMD), Fortran (GFortran).
 * **General & Scripting**: Python 3.12, JavaScript (Node.js 24), TypeScript (esbuild + Node), Ruby (3.3), PHP (8.3), Lua, Perl.
-* **Enterprise & JVM**: Java (OpenJDK 21), C# (Mono), Scala 3 (3.6), Kotlin (2.1), Groovy, Clojure.
+* **Enterprise & JVM**: Java (OpenJDK 21), C# (Mono), F# (.NET/Mono), Scala 3 (3.6), Kotlin (2.1), Clojure.
 * **Functional & Scientific**: Julia (1.11), Haskell (GHC 9.6), OCaml (5.1), Elixir, Erlang.
 * **Mobile & Modern**: Swift (6.0), Dart, R, Bash.
 
