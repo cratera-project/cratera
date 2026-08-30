@@ -7,6 +7,16 @@ on:
       - master
     tags:
       - 'v*'
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/pull_request_template.md'
+      - '.github/FUNDING.yml'
+      - 'LICENSE'
+      - 'GOVERNANCE.md'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
   release:
     types: [published]
   workflow_dispatch:

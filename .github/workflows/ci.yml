@@ -3,8 +3,28 @@ name: CI
 on:
   push:
     branches: [ master, main, dev ]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/pull_request_template.md'
+      - '.github/FUNDING.yml'
+      - 'LICENSE'
+      - 'GOVERNANCE.md'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
   pull_request:
     branches: [ master, main, dev ]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/pull_request_template.md'
+      - '.github/FUNDING.yml'
+      - 'LICENSE'
+      - 'GOVERNANCE.md'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
 
 env:
   CARGO_TERM_COLOR: always
@@ -78,15 +98,32 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Detect changed microVM-relevant files
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            vm_relevant:
+              - 'crates/**'
+              - 'scripts/**'
+              - 'languages.toml'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'Dockerfile.rootfs'
+              - 'rust-toolchain.toml'
+
       - name: Install Rust toolchain with musl target
+        if: steps.filter.outputs.vm_relevant == 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
 
       - name: Cargo Cache
+        if: steps.filter.outputs.vm_relevant == 'true'
         uses: Swatinem/rust-cache@v2
 
       - name: Enable Host KVM Virtualization
+        if: steps.filter.outputs.vm_relevant == 'true'
         run: |
           sudo usermod -aG kvm $USER 2>/dev/null || true
           sudo chmod 666 /dev/kvm 2>/dev/null || true
@@ -97,13 +134,20 @@ jobs:
           fi
 
       - name: Fetch Firecracker Runtime & Linux Kernel
+        if: steps.filter.outputs.vm_relevant == 'true'
         run: ./scripts/fetch-runtime.sh
 
       - name: Build Minimal Guest Rootfs (Rust)
+        if: steps.filter.outputs.vm_relevant == 'true'
         run: LANGUAGES="minimal" ./scripts/build-rootfs.sh
 
       - name: Run In-Guest Smoke Test (Hardware MicroVM)
+        if: steps.filter.outputs.vm_relevant == 'true'
         run: ./scripts/smoke.sh minimal
+
+      - name: Skip notice (no microVM-relevant files changed)
+        if: steps.filter.outputs.vm_relevant != 'true'
+        run: echo "No microVM-relevant files changed — skipping KVM smoke test."
 
   build:
     name: Release Binaries
