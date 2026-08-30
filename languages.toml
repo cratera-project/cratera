@@ -1,0 +1,470 @@
+# ==============================================================================
+# CRATERA DECLARATIVE LANGUAGE MANIFEST (TOP 30 LANGUAGES)
+# ==============================================================================
+# Single source of truth for all language runtimes, compilers, and microVM tasks.
+#
+# HOW IT WORKS:
+#   1. Set `enabled = true` or `enabled = false` to include/exclude any language.
+#   2. Run `./scripts/install.sh` (or `./scripts/build-rootfs.sh`) to rebuild rootfs.ext4.
+#
+# FOUR WAYS TO INSTALL ANY LANGUAGE:
+#   • install = "docker_image"      (Copy from official Docker Hub tags)
+#   • install = "curl_tar"          (Download & extract standalone binary archive)
+#   • install = "apt_core"          (Install standard Linux package via apt)
+#   • install = "docker_image_base" (Use official image as Docker FROM base)
+#
+# apt_prereqs = [...]                (Extra apt packages needed for headers/libs)
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. RUST (Edition 2024 / Latest Stable)
+# ------------------------------------------------------------------------------
+[rust]
+enabled = true
+name = "Rust"
+source = "job.rs"
+compile = "rustc --edition 2024 -C panic=abort -C opt-level=2 -C link-arg=-fno-use-linker-plugin -o /tmp/job {file}"
+run = "/tmp/job"
+is_rust = true
+test_code = "fn add(a: i32, b: i32) -> i32 { a + b }"
+test_harness = "{{SOLUTION}}\n\nfn main() { assert_eq!(add(2, 3), 5); }"
+
+install = "curl_tar"
+source_url = "https://static.rust-lang.org/dist/rust-1.97.1-x86_64-unknown-linux-gnu.tar.gz"
+tar_strip = 1
+install_prefix = "/usr"
+install_args = "rustc,rust-std-x86_64-unknown-linux-gnu"
+apt_prereqs = ["build-essential", "gcc", "libc6-dev"]
+
+# ------------------------------------------------------------------------------
+# 2. PYTHON 3 (Latest Active)
+# ------------------------------------------------------------------------------
+[python]
+enabled = true
+name = "Python"
+source = "job.py"
+run = "python3 {file}"
+test_code = "x = 100 + 200\nprint(x)\nassert x == 300"
+
+install = "apt_core"
+apt_packages = ["python3", "python3-minimal"]
+apt_prereqs = []
+
+# ------------------------------------------------------------------------------
+# 3. JAVASCRIPT (Node.js 24 LTS / Current)
+# ------------------------------------------------------------------------------
+[node]
+enabled = true
+name = "JavaScript"
+source = "job.js"
+run = "node {file}"
+test_code = "console.log('Node: ' + process.version);"
+
+install = "docker_image"
+image = "node:24-bookworm-slim"
+copy_paths = ["/usr/local/bin/node"]
+apt_prereqs = []
+
+# ------------------------------------------------------------------------------
+# 4. TYPESCRIPT (Latest Stable via esbuild)
+# ------------------------------------------------------------------------------
+[typescript]
+enabled = true
+name = "TypeScript"
+source = "job.ts"
+compile = "esbuild {file} --bundle --platform=node --outfile=/tmp/job.js"
+run = "node /tmp/job.js"
+test_code = "const x: number = 42; console.log(x);"
+
+install = "curl_tar"
+source_url = "https://registry.npmjs.org/@esbuild/linux-x64/-/linux-x64-0.24.0.tgz"
+tar_strip = 0
+custom_extract = "tar -xzf /tmp/pkg.tar.gz -C /tmp && mv /tmp/package/bin/esbuild /usr/local/bin/esbuild && rm -rf /tmp/package"
+apt_prereqs = []
+
+# ------------------------------------------------------------------------------
+# 5. C++ (GCC 14 / C++20 / C++23)
+# ------------------------------------------------------------------------------
+[cpp]
+enabled = true
+name = "C++"
+source = "job.cpp"
+compile = "g++ -O3 -std=c++20 -o /tmp/job {file}"
+run = "/tmp/job"
+test_code = "#include <iostream>\nint main() { std::cout << \"C++ OK\" << std::endl; return 0; }"
+
+install = "apt_core"
+apt_packages = ["g++"]
+apt_prereqs = ["build-essential", "libc6-dev"]
+
+# ------------------------------------------------------------------------------
+# 6. C (GCC 14 / C17 / C23)
+# ------------------------------------------------------------------------------
+[c]
+enabled = true
+name = "C"
+source = "job.c"
+compile = "gcc -O3 -std=c17 -o /tmp/job {file}"
+run = "/tmp/job"
+test_code = "#include <stdio.h>\nint main() { printf(\"C OK\\n\"); return 0; }"
+
+install = "apt_core"
+apt_packages = ["gcc"]
+apt_prereqs = ["build-essential", "libc6-dev"]
+
+# ------------------------------------------------------------------------------
+# 7. GO (Go 1.24 Latest)
+# ------------------------------------------------------------------------------
+[go]
+enabled = true
+name = "Go"
+source = "main.go"
+compile = "go build -o /tmp/job {file}"
+run = "/tmp/job"
+test_code = "package main\nimport \"fmt\"\nfunc main() { fmt.Println(\"Go OK\") }"
+
+install = "apt_core"
+apt_packages = ["golang-go"]
+apt_prereqs = ["build-essential", "libc6-dev"]
+
+# ------------------------------------------------------------------------------
+# 8. JAVA (OpenJDK 21 LTS)
+# ------------------------------------------------------------------------------
+[java]
+enabled = true
+name = "Java"
+source = "Solution.java"
+compile = "javac -d /tmp {file}"
+run = "java -cp /tmp Solution"
+test_code = "public class Solution { public static void main(String[] args) { System.out.println(\"Java OK\"); } }"
+
+install = "apt_core"
+apt_packages = ["openjdk-21-jdk-headless"]
+apt_prereqs = []
+
+# ------------------------------------------------------------------------------
+# 9. C# (.NET / Mono)
+# ------------------------------------------------------------------------------
+[csharp]
+enabled = true
+name = "C#"
+source = "Program.cs"
+compile = "mono /usr/lib/mono/4.5/mcs.exe -out:/tmp/job.exe {file}"
+run = "mono /tmp/job.exe"
+test_code = "using System; class Program { static void Main() { Console.WriteLine(\"C# OK\"); } }"
+
+install = "apt_core"
+apt_packages = ["mono-devel"]
+apt_prereqs = []
+
+# ------------------------------------------------------------------------------
+# 10. RUBY (Ruby 3.4 / 3.2)
+# ------------------------------------------------------------------------------
+[ruby]
+enabled = true
+name = "Ruby"
+source = "job.rb"
+run = "ruby {file}"
+test_code = "x = 100 + 200\nputs \"Ruby OK: #{x}\"\nexit(1) unless x == 300"
+
+install = "apt_core"
+apt_packages = ["ruby"]
+apt_prereqs = []
+
+# ------------------------------------------------------------------------------
+# 11. PHP (PHP 8.4 / 8.3 CLI)
+# ------------------------------------------------------------------------------
+[php]
+enabled = true
+name = "PHP"
+source = "job.php"
+run = "php {file}"
+test_code = "<?php $x = 100 + 200; echo \"PHP OK: $x\n\"; if ($x !== 300) exit(1);"
+
+install = "apt_core"
+apt_packages = ["php-cli"]
+apt_prereqs = []
+
+# ------------------------------------------------------------------------------
+# 12. SWIFT (Swift 6.0 Official Apple Release)
+# ------------------------------------------------------------------------------
+[swift]
+enabled = true
+name = "Swift"
+source = "job.swift"
+compile = "swiftc -O -o /tmp/job {file}"
+run = "/tmp/job"
+test_code = "let x = 100 + 200\nprint(\"Swift OK: \\(x)\")\nassert(x == 300)"
+
+install = "docker_image_base"
+image = "swift:6.0-noble"
+apt_prereqs = ["libicu74", "libcurl4", "libxml2", "libedit2", "libncurses6", "libsqlite3-0", "tzdata"]
+
+# ------------------------------------------------------------------------------
+# 13. ZIG (Zig 0.14.0 Latest Release)
+# ------------------------------------------------------------------------------
+[zig]
+enabled = true
+name = "Zig"
+source = "job.zig"
+compile = "zig build-exe -O ReleaseFast -femit-bin=/tmp/job {file}"
+run = "/tmp/job"
+test_code = "const std = @import(\"std\"); pub fn main() !void { std.debug.print(\"Zig OK\\n\", .{}); }"
+
+install = "curl_tar"
+source_url = "https://ziglang.org/download/0.14.0/zig-linux-x86_64-0.14.0.tar.xz"
+custom_extract = "mkdir -p /usr/local/zig && tar -xf /tmp/pkg.tar.gz -C /usr/local/zig --strip-components=1 && ln -sfn /usr/local/zig/zig /usr/local/bin/zig"
+apt_prereqs = []
+
+# ------------------------------------------------------------------------------
+# 14. KOTLIN (Kotlin 2.1 Latest)
+# ------------------------------------------------------------------------------
+[kotlin]
+enabled = true
+name = "Kotlin"
+source = "job.kt"
+compile = "kotlinc {file} -include-runtime -d /tmp/job.jar"
+run = "java -jar /tmp/job.jar"
+test_code = "fun main() { val x = 100 + 200; println(\"Kotlin OK: $x\"); check(x == 300) }"
+
+install = "curl_tar"
+source_url = "https://github.com/JetBrains/kotlin/releases/download/v2.1.10/kotlin-compiler-2.1.10.zip"
+tar_strip = 1
+custom_extract = "unzip -q /tmp/pkg.tar.gz -d /tmp && mv /tmp/kotlinc /usr/local/kotlinc && ln -sfn /usr/local/kotlinc/bin/kotlinc /usr/local/bin/kotlinc && rm -rf /tmp/kotlinc"
+apt_prereqs = ["openjdk-21-jdk-headless", "unzip"]
+
+# ------------------------------------------------------------------------------
+# 15. DART (Dart 3.7 Latest)
+# ------------------------------------------------------------------------------
+[dart]
+enabled = true
+name = "Dart"
+source = "job.dart"
+run = "/usr/lib/dart/bin/dart run {file}"
+test_code = "void main() { final x = 100 + 200; print('Dart OK: $x'); if (x != 300) throw Exception(); }"
+
+install = "docker_image"
+image = "dart:stable"
+copy_paths = ["/usr/lib/dart"]
+apt_prereqs = []
+
+# ------------------------------------------------------------------------------
+# 16. JULIA (Julia 1.11 Latest Stable)
+# ------------------------------------------------------------------------------
+[julia]
+enabled = true
+name = "Julia"
+source = "job.jl"
+run = "julia {file}"
+test_code = "x = 100 + 200; println(\"Julia OK: $x\"); @assert x == 300"
+
+install = "curl_tar"
+source_url = "https://julialang-s3.julialang.org/bin/linux/x64/1.11/julia-1.11.3-linux-x86_64.tar.gz"
+custom_extract = "mkdir -p /usr/local/julia && tar -xf /tmp/pkg.tar.gz -C /usr/local/julia --strip-components=1 && ln -sfn /usr/local/julia/bin/julia /usr/local/bin/julia"
+apt_prereqs = []
+
+# ------------------------------------------------------------------------------
+# 17. SCALA (Scala 3.6.3 Latest Official Standalone Release)
+# ------------------------------------------------------------------------------
+[scala]
+enabled = true
+name = "Scala"
+source = "Solution.scala"
+compile = "scalac -d /tmp {file}"
+run = "java -cp /usr/local/scala/lib/*:/tmp Solution"
+test_code = "object Solution { def main(args: Array[String]): Unit = { val x = 100 + 200; println(s\"Scala OK: $x\"); assert(x == 300) } }"
+
+install = "curl_tar"
+source_url = "https://github.com/scala/scala3/releases/download/3.6.3/scala3-3.6.3.tar.gz"
+custom_extract = "mkdir -p /usr/local/scala && tar -xf /tmp/pkg.tar.gz -C /usr/local/scala --strip-components=1 && ln -sfn /usr/local/scala/bin/scalac /usr/local/bin/scalac && ln -sfn /usr/local/scala/bin/scala /usr/local/bin/scala"
+apt_prereqs = ["openjdk-21-jdk-headless"]
+
+# ------------------------------------------------------------------------------
+# 18. NIM (Nim 2.2 Latest Release)
+# ------------------------------------------------------------------------------
+[nim]
+enabled = true
+name = "Nim"
+source = "job.nim"
+compile = "nim c -d:release --hints:off -o:/tmp/job {file}"
+run = "/tmp/job"
+test_code = "let x = 100 + 200\necho \"Nim OK: \", x\ndoAssert x == 300"
+
+install = "curl_tar"
+source_url = "https://nim-lang.org/download/nim-2.2.2-linux_x64.tar.xz"
+custom_extract = "mkdir -p /usr/local/nim && tar -xf /tmp/pkg.tar.gz -C /usr/local/nim --strip-components=1 && ln -sfn /usr/local/nim/bin/nim /usr/local/bin/nim"
+apt_prereqs = ["gcc", "libc6-dev"]
+
+# ------------------------------------------------------------------------------
+# 19. LUA (Lua 5.4)
+# ------------------------------------------------------------------------------
+[lua]
+enabled = true
+name = "Lua"
+source = "job.lua"
+run = "lua5.4 {file}"
+test_code = "local x = 100 + 200\nprint('Lua OK: ' .. x)\nassert(x == 300)"
+
+install = "apt_core"
+apt_packages = ["lua5.4"]
+apt_prereqs = []
+
+# ------------------------------------------------------------------------------
+# 20. R (R Statistics 4.4)
+# ------------------------------------------------------------------------------
+[r]
+enabled = true
+name = "R"
+source = "job.R"
+run = "Rscript {file}"
+test_code = "x <- 100 + 200\ncat('R OK:', x, '\\n')\nstopifnot(x == 300)"
+
+install = "apt_core"
+apt_packages = ["r-base-core"]
+apt_prereqs = []
+
+# ------------------------------------------------------------------------------
+# 21. HASKELL (GHC 9.4 / 9.10)
+# ------------------------------------------------------------------------------
+[haskell]
+enabled = true
+name = "Haskell"
+source = "job.hs"
+compile = "ghc -O2 -o /tmp/job {file}"
+run = "/tmp/job"
+test_code = "main :: IO ()\nmain = do\n  let x = 100 + 200\n  putStrLn (\"Haskell OK: \" ++ show x)\n  if x /= 300 then error \"fail\" else return ()"
+
+install = "apt_core"
+apt_packages = ["ghc", "libghc-base-dev"]
+apt_prereqs = []
+
+# ------------------------------------------------------------------------------
+# 22. ELIXIR (Elixir 1.18 Latest / OTP 27)
+# ------------------------------------------------------------------------------
+[elixir]
+enabled = true
+name = "Elixir"
+source = "job.exs"
+run = "elixir {file}"
+test_code = "x = 100 + 200\nIO.puts(\"Elixir OK: #{x}\")\nunless x == 300, do: System.halt(1)"
+
+install = "apt_core"
+apt_packages = ["elixir", "erlang-base"]
+apt_prereqs = []
+
+# ------------------------------------------------------------------------------
+# 23. ERLANG (Erlang/OTP)
+# ------------------------------------------------------------------------------
+[erlang]
+enabled = true
+name = "Erlang"
+source = "job.erl"
+compile = "erlc -o /tmp {file}"
+run = "erl -noshell -pa /tmp -s job start -s init stop"
+test_code = "-module(job).\n-export([start/0]).\nstart() -> X = 100 + 200, io:format(\"Erlang OK: ~p~n\", [X]), if X =:= 300 -> ok; true -> halt(1) end."
+
+install = "apt_core"
+apt_packages = ["erlang-base", "erlang-dev"]
+apt_prereqs = []
+
+# ------------------------------------------------------------------------------
+# 24. CLOJURE (Clojure 1.12 Tools)
+# ------------------------------------------------------------------------------
+[clojure]
+enabled = true
+name = "Clojure"
+source = "job.clj"
+run = "clojure {file}"
+test_code = "(let [x (+ 100 200)] (println (str \"Clojure OK: \" x)) (when-not (= x 300) (System/exit 1)))"
+
+install = "apt_core"
+apt_packages = ["clojure", "openjdk-21-jdk-headless"]
+apt_prereqs = []
+
+# ------------------------------------------------------------------------------
+# 25. OCAML (OCaml 5 Multicore)
+# ------------------------------------------------------------------------------
+[ocaml]
+enabled = true
+name = "OCaml"
+source = "job.ml"
+compile = "ocamlc -o /tmp/job {file}"
+run = "/tmp/job"
+test_code = "let () = let x = 100 + 200 in Printf.printf \"OCaml OK: %d\\n\" x; assert (x = 300)"
+
+install = "apt_core"
+apt_packages = ["ocaml-nox"]
+apt_prereqs = []
+
+# ------------------------------------------------------------------------------
+# 26. PERL (Perl 5.38 / 5.40)
+# ------------------------------------------------------------------------------
+[perl]
+enabled = true
+name = "Perl"
+source = "job.pl"
+run = "perl {file}"
+test_code = "my $x = 100 + 200;\nprint \"Perl OK: $x\\n\";\ndie unless $x == 300;"
+
+install = "apt_core"
+apt_packages = ["perl"]
+apt_prereqs = []
+
+# ------------------------------------------------------------------------------
+# 27. D (DLang / GDC)
+# ------------------------------------------------------------------------------
+[d]
+enabled = true
+name = "D"
+source = "job.d"
+compile = "gdc -O3 -o /tmp/job {file}"
+run = "/tmp/job"
+test_code = "import std.stdio; void main() { int x = 100 + 200; writeln(\"D OK: \", x); assert(x == 300); }"
+
+install = "apt_core"
+apt_packages = ["gdc"]
+apt_prereqs = ["build-essential", "libc6-dev"]
+
+# ------------------------------------------------------------------------------
+# 28. FORTRAN (GNU Fortran 14)
+# ------------------------------------------------------------------------------
+[fortran]
+enabled = true
+name = "Fortran"
+source = "job.f90"
+compile = "gfortran -O3 -o /tmp/job {file}"
+run = "/tmp/job"
+test_code = "program main\n  integer :: x\n  x = 100 + 200\n  print *, 'Fortran OK:', x\n  if (x /= 300) stop 1\nend program main"
+
+install = "apt_core"
+apt_packages = ["gfortran"]
+apt_prereqs = ["build-essential", "libc6-dev"]
+
+# ------------------------------------------------------------------------------
+# 29. F# (.NET / Mono FSharp)
+# ------------------------------------------------------------------------------
+[fsharp]
+enabled = true
+name = "F#"
+source = "job.fs"
+compile = "fsharpc --out:/tmp/job.exe {file}"
+run = "mono /tmp/job.exe"
+test_code = "open System\nlet x = 100 + 200\nprintfn \"F# OK: %d\" x\nif x <> 300 then Environment.Exit(1)"
+
+install = "apt_core"
+apt_packages = ["fsharp", "mono-devel"]
+apt_prereqs = []
+
+# ------------------------------------------------------------------------------
+# 30. BASH / SHELL (GNU Bash 5.2)
+# ------------------------------------------------------------------------------
+[bash]
+enabled = true
+name = "Bash"
+source = "job.sh"
+run = "bash {file}"
+test_code = "x=$((100 + 200))\necho \"Bash OK: $x\"\n[[ $x -eq 300 ]] || exit 1"
+
+install = "apt_core"
+apt_packages = []
+apt_prereqs = []

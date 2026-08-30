@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches: [ master, main, dev ]
+  pull_request:
+    branches: [ master, main, dev ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Lint & Coding Standards
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cargo Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Rust Formatting
+        run: cargo fmt --all --check
+
+      - name: Rust Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Shell Scripts Lint (shellcheck)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck scripts/*.sh examples/*.sh
+
+      - name: Manifest Validation (languages.toml)
+        run: |
+          python3 -c 'import tomllib; data = tomllib.load(open("languages.toml", "rb")); langs = data.get("languages", data); print(f"Valid TOML: {len(langs)} languages configured")'
+
+  test:
+    name: Unit & Contract Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run workspace unit & contract tests
+        run: cargo test --workspace
+
+  security:
+    name: Security Vulnerability Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Cargo Audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Audit Vulnerabilities (cargo audit)
+        run: cargo audit
+
+  integration:
+    name: KVM In-Guest Hardware Smoke Test
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain with musl target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Cargo Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Enable Host KVM Virtualization
+        run: |
+          sudo usermod -aG kvm $USER 2>/dev/null || true
+          sudo chmod 666 /dev/kvm 2>/dev/null || true
+          if [ -e /dev/kvm ]; then
+            echo "KVM ready: /dev/kvm accessible"
+          else
+            echo "Warning: /dev/kvm missing on runner"
+          fi
+
+      - name: Fetch Firecracker Runtime & Linux Kernel
+        run: ./scripts/fetch-runtime.sh
+
+      - name: Build Minimal Guest Rootfs (Rust)
+        run: LANGUAGES="minimal" ./scripts/build-rootfs.sh
+
+      - name: Run In-Guest Smoke Test (Hardware MicroVM)
+        run: ./scripts/smoke.sh minimal
+
+  build:
+    name: Release Binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain with musl target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Cargo Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release host coordinator (cratera)
+        run: cargo build --release -p cratera-api
+
+      - name: Build release guest agent (musl static)
+        run: cargo build --release -p cratera-guest-agent --target x86_64-unknown-linux-musl
+

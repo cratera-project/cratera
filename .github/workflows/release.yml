@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build & Package Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Cargo Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release host coordinator (cratera)
+        run: cargo build --release -p cratera-api
+
+      - name: Build release guest agent (musl static)
+        run: cargo build --release -p cratera-guest-agent --target x86_64-unknown-linux-musl
+
+      - name: Package Release Assets
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          DIST_NAME="cratera-${VERSION}-linux-x86_64"
+          mkdir -p "$DIST_NAME"
+          
+          # Binaries
+          cp target/release/cratera "$DIST_NAME/"
+          cp target/x86_64-unknown-linux-musl/release/cratera-guest-agent "$DIST_NAME/"
+          
+          # Configurations & Scripts
+          cp languages.toml "$DIST_NAME/"
+          cp -r scripts "$DIST_NAME/"
+          
+          # Documentation & Licenses
+          cp README.md LICENSE "$DIST_NAME/"
+          
+          # Create compressed archive and checksum
+          tar -czvf "${DIST_NAME}.tar.gz" "$DIST_NAME"
+          sha256sum "${DIST_NAME}.tar.gz" > "${DIST_NAME}.tar.gz.sha256"
+
+      - name: Create GitHub Release & Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            cratera-*-linux-x86_64.tar.gz
+            cratera-*-linux-x86_64.tar.gz.sha256
+          generate_release_notes: true
+          draft: false
+          prerelease: false

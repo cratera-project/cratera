@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: "Security & Vulnerability Disclosure"
+    url: "https://github.com/cratera-project/cratera/security/advisories/new"
+    about: "Report security vulnerabilities and sandbox escape vectors privately."
+  - name: "GitHub Discussions & Q&A"
+    url: "https://github.com/cratera-project/cratera/discussions"
+    about: "Ask questions, share self-hosting setups, and discuss RFCs."
+  - name: "Maintainer Contact"
+    url: "mailto:contact@cratera.org"
+    about: "Direct inquiries with the project maintainer."
