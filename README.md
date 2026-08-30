@@ -21,6 +21,7 @@ Each execution runs inside an ephemeral Linux KVM microVM with a read-only rootf
 ## Table of Contents
 
 - [Why Cratera](#why-cratera)
+- [Why Not Containers?](#why-not-containers)
 - [Architecture](#architecture)
 - [Quick Setup Guide](#quick-setup-guide)
   - [Prerequisites](#prerequisites)
@@ -57,11 +58,27 @@ Each execution runs inside an ephemeral Linux KVM microVM with a read-only rootf
 
 ## Why Cratera
 
-- Untrusted code, macro expansions, and system calls cannot touch the host kernel.
+- Untrusted code, macro expansions, and system calls are isolated from the host kernel by a hardware virtualization boundary (Intel VT-x / AMD-V), not shared namespaces or cgroups. Guest syscalls terminate entirely inside the guest kernel, never reaching the host.
 - Boots clean microVMs in milliseconds or restores from snapshots.
 - MicroVMs have zero network devices attached. Host coordinator enforces systemd eBPF sandboxing (`IPAddressDeny=any`) to block all non-localhost inbound and outbound traffic.
 - Measures in-guest user execution in microseconds ($\mu s$) and tracks anonymous RSS (`RssAnon`), filtering out shared library noise.
 - Integrates with Firecracker Jailer for dropped UID/GID (`20001`), chroot, cgroups v2, and isolated PID namespaces.
+
+---
+
+## Why Not Containers?
+
+The dominant open-source code execution judges — **Judge0**, **Piston** like self-hosted runners — rely on Linux containers (Docker + `isolate`, Docker `--privileged`, or managed cgroups). The shared-kernel model has a documented, public track record of full-host compromise from within sandboxed code:
+
+| Judge / Engine | Isolation Model | Notable CVEs / Issues |
+| :--- | :--- | :--- |
+| **Judge0** | Docker + `isolate` binary (shared kernel) | [CVE-2024-28189](https://nvd.nist.gov/vuln/detail/CVE-2024-28189) (CVSS **10.0**) — symlink attack → host file overwrite → RCE outside sandbox; [CVE-2024-28185](https://nvd.nist.gov/vuln/detail/CVE-2024-28185), [CVE-2024-29021](https://nvd.nist.gov/vuln/detail/CVE-2024-29021) — privileged container escape and SSRF chaining to full host root. Disclosed April 2024. |
+| **Piston** | Docker containers (shared kernel) | Relies on Docker isolation; inherits shared-kernel namespace escape risk. No dedicated security model document. |
+| **Cratera** | Firecracker KVM microVMs (hardware boundary) | Guest code interacts only with the guest Linux kernel. No shared namespaces. No privileged containers. See [docs/threat_model.md](docs/threat_model.md) for full analysis. |
+
+The root cause in every container-based escape is the same: the attacker's code and the host OS share a single Linux kernel. A single namespace misconfiguration, privileged flag, or kernel LPE turns a "sandboxed" job into full host access.
+
+Firecracker microVMs eliminate the shared-kernel surface entirely. Guest syscalls are trapped by KVM's hardware boundary, not by namespace filtering. A guest kernel panic or root-level exploit inside the VM does not propagate to the host. This structural difference is why Cratera uses microVMs rather than containers, and why it is self-hosted by design — you control the hypervisor, the host kernel patch level, and the entire stack.
 
 ---
 
