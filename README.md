@@ -18,6 +18,43 @@ Each execution runs inside an ephemeral Linux KVM microVM with a read-only rootf
 
 ---
 
+## Table of Contents
+
+- [Why Cratera](#why-cratera)
+- [Architecture](#architecture)
+- [Quick Setup Guide](#quick-setup-guide)
+  - [Prerequisites](#prerequisites)
+  - [Installation & Quick Start](#installation--quick-start)
+- [Interactive Command Center](#interactive-command-center)
+  - [1. System Doctor (`cratera doctor`)](#1-system-doctor-cratera-doctor)
+  - [2. Multi-Language Manager (`cratera lang`)](#2-multi-language-manager-cratera-lang)
+  - [3. Resource Budgets & Limits Editor (`cratera settings`)](#3-resource-budgets--limits-editor-cratera-settings)
+  - [4. MicroVM Smoke Tester (`cratera test <lang>`)](#4-microvm-smoke-tester-cratera-test-lang)
+  - [5. Persistent Background Coordinator (`cratera serve`)](#5-persistent-background-coordinator-cratera-serve)
+- [API Usage & Examples](#api-usage--examples)
+  - [1. Request Schema](#1-request-schema)
+  - [2. Ready-to-Run Example Script](#2-ready-to-run-example-script)
+  - [3. Direct cURL Examples](#3-direct-curl-examples)
+  - [JSON Response](#json-response)
+- [Verdict Codes](#verdict-codes)
+- [Multi-Language Configuration](#multi-language-configuration)
+  - [Out-of-the-Box Supported Languages (Top 30)](#out-of-the-box-supported-languages-top-30)
+  - [Declarative Recipe Engine](#declarative-recipe-engine)
+- [Configuration Reference](#configuration-reference)
+- [Systemd Service & Deployment](#systemd-service--deployment)
+  - [Systemd Directives & Environment Breakdown](#systemd-directives--environment-breakdown)
+  - [One-Command Activation](#one-command-activation)
+  - [Managing the Service via Cratera CLI & Command Center](#managing-the-service-via-cratera-cli--command-center)
+  - [Direct Systemctl Commands](#direct-systemctl-commands)
+- [Recommended Ingress: Cloudflare Zero Trust & Private Networks](#recommended-ingress-cloudflare-zero-trust--private-networks)
+- [Development & Verification](#development--verification)
+- [Troubleshooting & FAQ](#troubleshooting--faq)
+- [Community & Discussion](#community--discussion)
+- [Governance & Security](#governance--security)
+- [License](#license)
+
+---
+
 ## Why Cratera
 
 - Untrusted code, macro expansions, and system calls cannot touch the host kernel.

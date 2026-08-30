@@ -1,0 +1,74 @@
+name: Publish Rootfs Package
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish-rootfs-package:
+    name: Build & Publish Rootfs Container
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free Disk Space on Runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          sudo docker image prune --all --force || true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate Dockerfile from Manifest
+        run: |
+          chmod +x ./scripts/generate-dockerfile.sh
+          ./scripts/generate-dockerfile.sh languages.toml Dockerfile.rootfs all
+
+      - name: Determine Version Tags
+        id: meta
+        run: |
+          OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${OWNER_LOWER}/cratera-rootfs"
+          
+          # Extract version from Cargo.toml or git ref
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2 || echo "1.0.0")
+          fi
+          
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag_version=${IMAGE}:${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag_latest=${IMAGE}:latest" >> "$GITHUB_OUTPUT"
+
+      - name: Build and Push Rootfs to GitHub Packages
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.rootfs
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.tag_version }}
+            ${{ steps.meta.outputs.tag_latest }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
