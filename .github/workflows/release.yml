@@ -26,7 +26,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build release host coordinator (cratera)
-        run: cargo build --release -p cratera-api
+        run: cargo build --release -p cratera
 
       - name: Build release guest agent (musl static)
         run: cargo build --release -p cratera-guest-agent --target x86_64-unknown-linux-musl

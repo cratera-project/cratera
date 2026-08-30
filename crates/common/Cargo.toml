@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description = "Common protocol types and data structures for Cratera microVM execution."
+readme = "../../README.md"
 
 [dependencies]
 serde = { workspace = true }

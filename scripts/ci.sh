@@ -25,7 +25,7 @@ echo "==> [5/6] Running workspace unit & contract tests..."
 cargo test --workspace
 
 echo "==> [6/6] Building release host binary & guest agent (musl static)..."
-cargo build --release -p cratera-api
+cargo build --release -p cratera
 rustup target add x86_64-unknown-linux-musl 2>/dev/null || true
 cargo build --release -p cratera-guest-agent --target x86_64-unknown-linux-musl
 

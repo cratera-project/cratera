@@ -74,7 +74,7 @@ echo " Filter: $FILTER"
 echo "======================================================="
 
 echo "==> Building host binary (cratera)..."
-cargo build --release -p cratera-api
+cargo build --release -p cratera
 
 echo "==> Starting local Cratera coordinator..."
 pkill -9 cratera 2>/dev/null || true

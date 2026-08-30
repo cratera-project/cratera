@@ -1,18 +1,24 @@
 [package]
-name = "cratera-api"
+name = "cratera"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description = "Hardware-isolated code execution engine powered by Firecracker microVMs."
+readme = "../../README.md"
 
 [[bin]]
 name = "cratera"
 path = "src/main.rs"
 
 [dependencies]
-cratera-common = { path = "../common" }
-cratera-compiler = { path = "../compiler" }
-cratera-executor = { path = "../executor" }
+cratera-common = { path = "../common", version = "1.0.0" }
+cratera-compiler = { path = "../compiler", version = "1.0.0" }
+cratera-executor = { path = "../executor", version = "1.0.0" }
 tokio = { workspace = true }
 axum = { workspace = true }
 tower-http = { workspace = true }
