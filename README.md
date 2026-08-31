@@ -4,6 +4,7 @@
   <img alt="Cratera Logo Title" width="750" src="docs/images/cratera_logo.png">
 </picture>
 
+[![Crates.io](https://img.shields.io/crates/v/cratera.svg?color=orange)](https://crates.io/crates/cratera)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-orange.svg)](https://www.rust-lang.org)
 [![Firecracker](https://img.shields.io/badge/microVM-Firecracker-red.svg)](https://firecracker-microvm.github.io)
@@ -22,7 +23,7 @@ Each execution runs inside an ephemeral Linux KVM microVM with a read-only rootf
 
 - [Why Cratera](#why-cratera)
 - [Why Not Containers?](#why-not-containers)
-- [Architecture](#architecture)
+- [Architecture & Workspace Crates](#architecture--workspace-crates)
 - [Quick Setup Guide](#quick-setup-guide)
   - [Prerequisites](#prerequisites)
   - [Installation & Quick Start](#installation--quick-start)
@@ -82,7 +83,17 @@ Firecracker microVMs eliminate the shared-kernel surface entirely. Guest syscall
 
 ---
 
-## Architecture
+## Architecture & Workspace Crates
+
+Cratera is organized as a clean, modular Rust Cargo workspace:
+
+| Crate | Crates.io | Description |
+| :--- | :--- | :--- |
+| **[`cratera`](crates/api)** | [![Crates.io](https://img.shields.io/crates/v/cratera.svg)](https://crates.io/crates/cratera) | CLI binary, Command Center TUI, and HTTP Axum coordinator daemon (`POST /harness`). |
+| **[`cratera-executor`](crates/executor)** | [![Crates.io](https://img.shields.io/crates/v/cratera-executor.svg)](https://crates.io/crates/cratera-executor) | Firecracker microVM lifecycle, Jailer boundary, and ~5ms snapshot restore engine. |
+| **[`cratera-compiler`](crates/compiler)** | [![Crates.io](https://img.shields.io/crates/v/cratera-compiler.svg)](https://crates.io/crates/cratera-compiler) | Multi-language harness splicing and code validator. |
+| **[`cratera-common`](crates/common)** | [![Crates.io](https://img.shields.io/crates/v/cratera-common.svg)](https://crates.io/crates/cratera-common) | Shared protocol types, verdicts, and serialization models. |
+| **[`cratera-guest-agent`](crates/guest-agent)** | [![Crates.io](https://img.shields.io/crates/v/cratera-guest-agent.svg)](https://crates.io/crates/cratera-guest-agent) | In-guest vsock telemetry, process supervision, and execution runner. |
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -132,14 +143,13 @@ Firecracker microVMs eliminate the shared-kernel surface entirely. Guest syscall
 ### Installation & Quick Start
 
 ```bash
+# Option A: Install binary directly via Cargo from Crates.io
+cargo install cratera
+
+# Option B: Clone & run the automated interactive setup
 git clone https://github.com/cratera-project/cratera.git
 cd cratera
-
-# 1. Interactive setup (downloads kernel, tools, builds rootfs, installs cratera binary)
 ./scripts/install.sh
-
-# 2. Or install the 'cratera' binary directly to ~/.cargo/bin:
-cargo install --path crates/api
 ```
 
 ---
