@@ -1,0 +1,44 @@
+name: Docs & Links
+
+on:
+  push:
+    branches: [ master, main, dev ]
+    paths:
+      - '**.md'
+      - 'docs/**'
+      - 'languages.toml'
+      - '.github/workflows/docs.yml'
+  pull_request:
+    branches: [ master, main, dev ]
+    paths:
+      - '**.md'
+      - 'docs/**'
+      - 'languages.toml'
+      - '.github/workflows/docs.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  docs:
+    name: Markdown, Links & Docs Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify Markdown Links & Anchors (Lychee)
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: --offline --verbose --no-progress './**/*.md'
+          fail: true
+
+      - name: Rust Documentation Tests
+        run: cargo test --doc --workspace
+
+      - name: Validate Languages Manifest (languages.toml)
+        run: |
+          python3 -c 'import tomllib; data = tomllib.load(open("languages.toml", "rb")); langs = data.get("languages", data); print(f"Valid TOML: {len(langs)} runtimes configured")'

@@ -119,14 +119,14 @@ tunnel: <TUNNEL_UUID>
 credentials-file: /etc/cloudflared/<TUNNEL_UUID>.json
 
 ingress:
-  - hostname: judge.yourdomain.org
+  - hostname: judge.cratera.org
     service: http://127.0.0.1:3100
   - service: http_status:404
 ```
 
 Submit jobs from your backend:
 ```bash
-curl -s -X POST https://judge.yourdomain.org/harness \
+curl -s -X POST https://judge.cratera.org/harness \
   -H "CF-Access-Client-Id: <SERVICE_TOKEN_CLIENT_ID>" \
   -H "CF-Access-Client-Secret: <SERVICE_TOKEN_CLIENT_SECRET>" \
   -H "Authorization: Bearer <CRATERA_INTERNAL_KEY>" \

@@ -9,7 +9,7 @@
 [![Firecracker](https://img.shields.io/badge/microVM-Firecracker-red.svg)](https://firecracker-microvm.github.io)
 [![Zulip Chat](https://img.shields.io/badge/zulip-join_chat-5063f0.svg?logo=zulip&logoColor=white)](https://cratera.zulipchat.com)
 
-Cratera is a self-hosted code execution and judge engine. Built as a single Rust binary, it executes untrusted code inside hardware-isolated KVM microVMs protected by unprivileged Jailer containment and zero-network access instead of shared-kernel containers. It has powered [Cratery](https://cratery.cratera.org) in production as its execution engine since February 2026.
+Cratera is a self-hosted code execution and judge engine. Built as a single Rust binary, it executes untrusted code inside KVM microVMs with Firecracker Jailer containment and no guest network interface instead of shared-kernel containers. It has powered [Cratery](https://cratery.cratera.org) in production as its execution engine since February 2026.
 
 Cratera is built for:
 - Online judges and competitive programming platforms.
@@ -17,17 +17,19 @@ Cratera is built for:
 - AI coding agents that execute generated code in a hardened environment.
 - Internal code runner services that cannot trust shared-kernel containers.
 
-Most code execution sandboxes and online judges isolate programs using Linux cgroups and namespaces (such as Docker or `isolate`), where sandboxed processes share the host kernel. This shared-kernel model has produced critical vulnerabilities: Judge0, for example, experienced sandbox escapes to host root ([CVE-2024-28185](https://nvd.nist.gov/vuln/detail/CVE-2024-28185), [CVE-2024-28189](https://nvd.nist.gov/vuln/detail/CVE-2024-28189), and [CVE-2024-29021](https://nvd.nist.gov/vuln/detail/CVE-2024-29021), CVSS 9.1 to 10.0, patched in v1.13.1+). Cratera avoids this failure class structurally: guest system calls execute against a dedicated guest kernel trapped by KVM hardware virtualization (Intel VT-x / AMD-V) rather than namespace boundaries.
+Most code execution sandboxes and online judges isolate programs using Linux cgroups and namespaces (such as Docker or `isolate`), where sandboxed processes share the host kernel. This shared-kernel model has produced critical vulnerabilities: Judge0, for example, experienced sandbox escapes to host root ([CVE-2024-28185](https://nvd.nist.gov/vuln/detail/CVE-2024-28185), [CVE-2024-28189](https://nvd.nist.gov/vuln/detail/CVE-2024-28189), and [CVE-2024-29021](https://nvd.nist.gov/vuln/detail/CVE-2024-29021), CVSS 9.1 to 10.0, patched in v1.13.1+). Cratera avoids the specific shared-host-kernel escape class by executing workloads under a separate guest Linux kernel, while KVM hardware virtualization provides the CPU and memory isolation boundary from the host.
 
 ## Feature Comparison
+
+*These systems use different isolation models, workloads, and runtime targets. Latency and capability figures reflect their standard architecture.*
 
 | Feature | Cratera | Judge0 | Piston | gVisor (`runsc`) | Wasmtime |
 | :--- | :---: | :---: | :---: | :---: | :---: |
 | **Isolation Model**<br>Underlying security boundary used to sandbox untrusted user code. | **Hardware KVM microVM** | Shared-kernel container (`isolate`) | Shared-kernel container (Docker) | User-space kernel (`runsc`) | Process memory sandbox |
-| **Dedicated Guest Kernel**<br>Guest syscalls terminate in a separate guest kernel instead of reaching host ring-0. | **Yes** | No | No | Filtered (Emulated) | Not applicable |
-| **Immunity to Shared-Kernel Escapes**<br>Vulnerabilities in Linux namespaces or host kernel LPEs do not grant host root. | **Yes** | No ([CVE-2024-28189](https://nvd.nist.gov/vuln/detail/CVE-2024-28189)) | No | Partial | Yes |
+| **Dedicated Guest Kernel**<br>Guest processes execute against a separate Linux guest kernel rather than the host kernel. | **Yes** | No | No | Filtered (Emulated) | Not applicable |
+| **Isolation against container-class escapes**<br>Isolation against container breakout vulnerabilities sharing the host kernel. | **Separate guest kernel** | Shared host kernel ([CVE-2024-28189](https://nvd.nist.gov/vuln/detail/CVE-2024-28189)) | Shared host kernel | User-space kernel | WASM sandbox |
 | **Arbitrary Linux Binaries**<br>Executes standard Linux binaries (add any in 6 lines of TOML). | **Yes** (30+ built-in) | Yes (60+ runtimes) | Yes (40+ runtimes) | Most binaries | No (WASM only) |
-| **Startup and Restore Latency**<br>Time required to prepare a clean execution environment for a job. | **~5ms** (snapshot restore) | 50ms to 200ms | 100ms to 300ms | 50ms to 150ms | <1ms |
+| **Startup and Restore Latency**<br>Time required to prepare a clean execution environment for a job. | **~5ms observed** (snapshot restore) | 50ms to 200ms | 100ms to 300ms | 50ms to 150ms | <1ms |
 | **In-Guest Telemetry**<br>Measures execution time and anonymous memory directly inside the environment. | **Yes** (Microsecond / RssAnon) | Partial (`isolate` cgroups) | No (Host cgroups) | Partial | Partial |
 | **Default Network Isolation**<br>Execution environment has all network devices disabled by default. | **Yes** (Zero NICs) | Configurable | Configurable | Configurable | Yes (No sockets) |
 | **Deployment Model**<br>Required host dependencies and services to run the engine. | **Single Rust binary** | Docker, Postgres, Redis | Docker, Node.js | Docker / Containerd | Single binary / library |
@@ -37,13 +39,19 @@ Most code execution sandboxes and online judges isolate programs using Linux cgr
 
 ## Security Model
 
-Cratera uses a multi-layer defense-in-depth architecture. The primary boundary is the KVM hypervisor: untrusted code runs inside a dedicated guest kernel and communicates with the host coordinator strictly over vsock on port 52.
+Cratera uses a multi-layer defense-in-depth architecture:
 
-To minimize residual attack surface on the host:
-- MicroVM processes run inside an unprivileged Firecracker Jailer chroot with dropped UID/GID (`20001`) and host cgroup limits.
-- The host systemd unit enforces kernel eBPF network filtering (`IPAddressDeny=any`), preventing network egress.
-- MicroVMs have zero virtual network devices attached in the guest.
-- Each microVM is ephemeral and destroyed immediately upon job completion.
+- KVM hardware virtualization with a dedicated guest Linux kernel.
+- Firecracker Jailer chroot, dropped UID/GID (`20001`), and host cgroup limits.
+- MicroVMs have zero virtual network devices attached in the guest; the included systemd unit blocks external coordinator traffic with `IPAddressDeny=any`.
+- MicroVMs are ephemeral and destroyed immediately upon job completion.
+
+### Threat Model Summary
+
+Cratera assumes submitted code is actively malicious.
+
+- **Protected**: Host filesystem, host processes, other execution jobs, and host network access from the guest.
+- **Out of scope**: Compromised physical host, host KVM / CPU microcode zero-days, and a compromised host root administrator.
 
 For full residual risk ratings and threat analysis, read [SECURITY.md](SECURITY.md) and [docs/threat_model.md](docs/threat_model.md).
 
@@ -85,7 +93,7 @@ Cratera is organized as a Cargo workspace:
 │   │    └── Execute & Measure (Microsecond / RssAnon)    │   │
 │   └─────────────────────────────────────────────────────┘   │
 │                                                             │
-│   Storage: Read-Only SquashFS / ext4   │  RAM: 256MB tmpfs  │
+│   Storage: Read-Only rootfs    │  Workspace: 256MB tmpfs    │
 └──────────────────────────────┬──────────────────────────────┘
                                │
                                │ JSON Verdict over Vsock
@@ -108,42 +116,25 @@ Cratera is organized as a Cargo workspace:
 
 ### Installation
 
-Clone and run the automated setup script:
+**Option A: Automated setup script (Recommended)**
 ```bash
+# Clones, downloads kernel, builds guest rootfs, and compiles cratera
 git clone https://github.com/cratera-project/cratera.git
 cd cratera
 ./scripts/install.sh
 ```
 
-Or install the CLI binary with Cargo:
+**Option B: Install binary via Cargo**
 ```bash
 cargo install cratera
 ```
+*Note: The binary requires guest images (kernel and rootfs); run `./scripts/install.sh` or `cratera doctor` to verify environment assets.*
 
 ---
 
-## Interactive Command Center
+## CLI
 
-Run `cratera` in your terminal to open the management menu:
-
-```
-╭─────────────────────────────────────────────────────────────╮
-│             CRATERA INTERACTIVE COMMAND CENTER              │
-│     Hardware MicroVM Isolation & Multi-Language Sandbox     │
-│           Systemd: ● Service Active & Supervised            │
-╰─────────────────────────────────────────────────────────────╯
-
-  [1] System Diagnostics & Health Check (/dev/kvm, Jailer, storage, kernel)
-  [2] Multi-Language Toolchains Manager (Toggle 30 languages, apply presets)
-  [3] Resource Budgets & Limits Editor (vCPU, RAM, cgroups, timeouts)
-  [4] In-Guest MicroVM Smoke Tester (Measure microsecond execution)
-  [5] Build / Rebuild Guest Rootfs Image (SquashFS / ext4)
-  [6] Start / Stop Local Dev Server [Active on 127.0.0.1:3100]
-  [7] Systemd Service Manager [Active & Running]
-  [0] Exit Command Center
-```
-
-You can also run tasks directly from the shell:
+Running `cratera` without arguments opens the interactive terminal menu. You can also run tasks directly from the shell:
 
 ```bash
 # Check KVM access, Jailer setup, and image health
@@ -167,7 +158,7 @@ cratera serve
 
 ## API Usage
 
-Send a `POST /harness` request to execute code inside a fresh microVM.
+Send a `POST /harness` request to execute code in an isolated microVM instance. Each execution starts from a clean guest state, using snapshot restore when enabled.
 
 ### Request Body
 
@@ -177,6 +168,15 @@ Send a `POST /harness` request to execute code inside a fresh microVM.
 | `code` | string | **Yes** | None | Source code to execute inside the guest. |
 | `mode` | string | Optional | `"run"` | Execution mode: `"run"` (2 seconds) or `"submit"` (5 seconds). |
 | `harness` | string | Optional | `""` | Optional test harness template. |
+
+### HTTP Status Codes
+
+| Code | Meaning |
+| :--- | :--- |
+| `200` | Execution completed successfully; inspect verdict in JSON body. |
+| `400` | Invalid request payload or missing required `code` parameter. |
+| `401` | Missing or invalid Bearer authentication token. |
+| `500` | Internal infrastructure or microVM initialization failure. |
 
 ### Running Examples
 
@@ -236,7 +236,7 @@ curl -s -X POST http://127.0.0.1:3100/harness \
 | Verdict | Status | Description |
 | :--- | :--- | :--- |
 | `AC` | Passed | Solution passed all test assertions (exit code 0). |
-| `WA` | Test Failed | Assertion failed (`assert!` panic). |
+| `WA` | Test Failed | Assertion failed or solution output incorrect. |
 | `CE` | Compilation Error | Compilation failed. |
 | `TLE` | Time Limit Exceeded | Execution exceeded runtime timeout. |
 | `MLE` | Memory Limit Exceeded | Process exceeded memory budget. |
@@ -272,13 +272,13 @@ Cratera reads settings from environment variables or a `.env` file:
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `CRATERA_BIND` | `127.0.0.1:3100` | Host HTTP API bind address. |
+| `CRATERA_BIND` | `127.0.0.1:3100` | Host HTTP API bind address (localhost only by default). |
 | `CRATERA_INTERNAL_KEY` | *(auto-generated)* | Shared secret for Bearer token authentication. |
 | `CRATERA_VCPU` | `2` | Virtual CPU cores allocated per microVM. |
 | `CRATERA_MEM_MIB` | `2048` | Guest RAM allocated per microVM in MiB. |
 | `CRATERA_RUN_MS` | `2000` | Execution time limit for test runs in milliseconds. |
 | `CRATERA_SUBMIT_MS` | `5000` | Execution time limit for submissions in milliseconds. |
-| `CRATERA_USE_JAILER` | `0` | Set to `1` to enable Firecracker Jailer isolation. |
+| `CRATERA_USE_JAILER` | `0` | Development default: `0` (disabled for local testing; production systemd service sets `1` for UID 20001 chroot). |
 
 For the complete list of variables and defaults, see [docs/configuration.md](docs/configuration.md).
 
@@ -287,6 +287,8 @@ For the complete list of variables and defaults, see [docs/configuration.md](doc
 ## Systemd Service
 
 A production unit file is provided at [`deploy/cratera.service`](deploy/cratera.service) with eBPF network isolation (`IPAddressDeny=any`), cgroups v2 resource delegation (`Delegate=yes`), and Jailer unprivileged execution (UID/GID `20001`).
+
+The coordinator service starts as `root` on the host to manage KVM ioctls and Jailer cgroups; Jailer then drops the Firecracker microVM child process to unprivileged UID/GID `20001`.
 
 ```ini
 [Unit]
@@ -374,6 +376,7 @@ Add your user account to the `kvm` group:
 sudo usermod -aG kvm $USER
 newgrp kvm
 ```
+*Note: Membership in the `kvm` group grants access to host virtualization ioctls; treat it as a privileged capability.*
 
 ### Language not found in manifest
 
@@ -384,7 +387,7 @@ cratera build
 
 ### Zero network access inside microVMs
 
-MicroVMs have no network interfaces attached by design. Package managers such as `pip install`, `npm install`, and `cargo install` will deliberately fail at runtime inside the guest. All dependencies, compilers, and packages must be declared in [`languages.toml`](languages.toml) during root filesystem build time.
+MicroVMs have no network interfaces attached by design. Package managers such as `pip`, `npm`, and `cargo` are unavailable at runtime because the guest has no network interface. All dependencies and compilers must be declared in [`languages.toml`](languages.toml) during root filesystem build time.
 
 ---
 
