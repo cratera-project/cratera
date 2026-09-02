@@ -52,6 +52,20 @@ pub fn run_doctor() -> anyhow::Result<()> {
 
     // 2. Host Isolation & Jailer
     println!("{BOLD}[2/5] Host Sandbox & Security Boundaries:{RESET}");
+    let production = std::env::var("NODE_ENV").as_deref() == Ok("production");
+    let jailer_on = std::env::var("CRATERA_USE_JAILER")
+        .or_else(|_| std::env::var("GRADE_USE_JAILER"))
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if production && !jailer_on {
+        all_ok = false;
+        println!("  {RED}✗{RESET} Jailer disabled in production (CRATERA_USE_JAILER=0)");
+        println!(
+            "    {DIM}Fix: set CRATERA_USE_JAILER=1 or remove CRATERA_USE_JAILER=0 from .env{RESET}"
+        );
+    } else if jailer_on {
+        println!("  {GREEN}✓{RESET} Jailer enabled");
+    }
     let uid_check = Command::new("id").args(["-u", "20001"]).output();
     match uid_check {
         Ok(out) if out.status.success() => {

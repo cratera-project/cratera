@@ -971,6 +971,8 @@ fn spawn_vm(
             &format!("memory.max={mem_max}"),
             "--cgroup",
             &format!("pids.max={}", cfg.jail_pids_max),
+            "--seccomp-level",
+            "2",
             "--new-pid-ns",
             "--",
         ]);

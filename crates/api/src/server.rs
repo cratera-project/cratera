@@ -191,6 +191,9 @@ pub async fn start_server() -> anyhow::Result<()> {
         .unwrap_or(MAX_TIME_MS);
 
     let cfg = ExecutorConfig::from_env();
+    if std::env::var("NODE_ENV").as_deref() == Ok("production") && !cfg.use_jailer {
+        anyhow::bail!("Jailer required in production (CRATERA_USE_JAILER=0 is set)");
+    }
     tokio::fs::create_dir_all(&cfg.work_dir)
         .await
         .context("create work dir")?;
