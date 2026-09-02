@@ -16,9 +16,9 @@ name = "cratera"
 path = "src/main.rs"
 
 [dependencies]
-cratera-common = { path = "../common", version = "1.0.0" }
-cratera-compiler = { path = "../compiler", version = "1.0.0" }
-cratera-executor = { path = "../executor", version = "1.0.0" }
+cratera-common = { path = "../common", version = "1.1.0" }
+cratera-compiler = { path = "../compiler", version = "1.1.0" }
+cratera-executor = { path = "../executor", version = "1.1.0" }
 tokio = { workspace = true }
 axum = { workspace = true }
 tower-http = { workspace = true }

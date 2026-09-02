@@ -12,7 +12,7 @@ description = "Firecracker microVM execution engine and snapshot manager for Cra
 readme = "../../README.md"
 
 [dependencies]
-cratera-common = { path = "../common", version = "1.0.0" }
+cratera-common = { path = "../common", version = "1.1.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
