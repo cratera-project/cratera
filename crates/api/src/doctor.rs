@@ -47,10 +47,7 @@ pub fn run_doctor() -> anyhow::Result<()> {
         }
     }
 
-    if let Ok(smt) = fs::read_to_string("/sys/devices/system/cpu/smt/control") {
-        let smt_trimmed = smt.trim();
-        println!("  {DIM}• SMT / Hyperthreading status:{RESET} {smt_trimmed}");
-    }
+    check_cpu_mitigations(&mut all_ok);
     println!();
 
     // 2. Host Isolation & Jailer
@@ -199,6 +196,124 @@ pub fn run_doctor() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn check_cpu_mitigations(all_ok: &mut bool) {
+    match classify_smt(
+        fs::read_to_string("/sys/devices/system/cpu/smt/active")
+            .ok()
+            .as_deref(),
+        fs::read_to_string("/sys/devices/system/cpu/smt/control")
+            .ok()
+            .as_deref(),
+    ) {
+        MitigationCheck::Pass(msg) => println!("  {GREEN}✓{RESET} {msg}"),
+        MitigationCheck::Fail(msg) => {
+            *all_ok = false;
+            println!("  {RED}✗{RESET} {msg}");
+            println!(
+                "    {DIM}Fix: nosmt on the host cmdline, or echo off | sudo tee /sys/devices/system/cpu/smt/control{RESET}"
+            );
+        }
+        MitigationCheck::Unknown(msg) => println!("  {YELLOW}!{RESET} {msg}"),
+    }
+
+    let vuln_dir = Path::new("/sys/devices/system/cpu/vulnerabilities");
+    if vuln_dir.is_dir() {
+        let mut names: Vec<String> = fs::read_dir(vuln_dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        names.sort();
+        let mut vulnerable = 0usize;
+        let mut checked = 0usize;
+        for name in &names {
+            let path = vuln_dir.join(name);
+            let Ok(contents) = fs::read_to_string(&path) else {
+                continue;
+            };
+            checked += 1;
+            if vulnerability_unmitigated(&contents) {
+                vulnerable += 1;
+                *all_ok = false;
+                let detail = contents.trim().replace('\n', " ");
+                println!("  {RED}✗{RESET} CPU vulnerability {name}: {detail}");
+            }
+        }
+        if vulnerable == 0 && checked > 0 {
+            println!("  {GREEN}✓{RESET} CPU vulnerabilities: {checked} mitigated or not affected");
+        } else if vulnerable > 0 {
+            println!(
+                "    {DIM}Fix: update host kernel and CPU microcode ({vulnerable}/{checked} unmitigated){RESET}"
+            );
+        }
+    } else {
+        println!(
+            "  {YELLOW}!{RESET} CPU vulnerability sysfs not present; cannot verify Spectre/L1TF/MDS"
+        );
+    }
+
+    match classify_ksm(fs::read_to_string("/sys/kernel/mm/ksm/run").ok().as_deref()) {
+        MitigationCheck::Pass(msg) => println!("  {GREEN}✓{RESET} {msg}"),
+        MitigationCheck::Fail(msg) => {
+            *all_ok = false;
+            println!("  {RED}✗{RESET} {msg}");
+            println!("    {DIM}Fix: echo 0 | sudo tee /sys/kernel/mm/ksm/run{RESET}");
+        }
+        MitigationCheck::Unknown(msg) => println!("  {YELLOW}!{RESET} {msg}"),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum MitigationCheck {
+    Pass(String),
+    Fail(String),
+    Unknown(String),
+}
+
+fn classify_smt(active: Option<&str>, control: Option<&str>) -> MitigationCheck {
+    if let Some(a) = active {
+        return if a.trim() == "1" {
+            MitigationCheck::Fail("SMT / Hyper-Threading is enabled".into())
+        } else {
+            MitigationCheck::Pass("SMT / Hyper-Threading is disabled".into())
+        };
+    }
+    match control.map(str::trim) {
+        Some("on") => MitigationCheck::Fail("SMT / Hyper-Threading is enabled".into()),
+        Some("off") | Some("forceoff") => {
+            MitigationCheck::Pass("SMT / Hyper-Threading is disabled".into())
+        }
+        Some("notsupported") => {
+            MitigationCheck::Pass("SMT / Hyper-Threading not supported on this CPU".into())
+        }
+        Some(other) => {
+            MitigationCheck::Unknown(format!("SMT / Hyper-Threading status unknown: {other}"))
+        }
+        None => {
+            MitigationCheck::Unknown("SMT sysfs not present; cannot verify Hyper-Threading".into())
+        }
+    }
+}
+
+fn vulnerability_unmitigated(contents: &str) -> bool {
+    contents
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("vulnerable")
+}
+
+fn classify_ksm(run: Option<&str>) -> MitigationCheck {
+    match run.map(str::trim) {
+        None => MitigationCheck::Pass("KSM not present (equivalent to disabled)".into()),
+        Some("0") => MitigationCheck::Pass("KSM disabled".into()),
+        Some("1") => MitigationCheck::Fail("KSM is enabled (shared pages leak across VMs)".into()),
+        Some(other) => MitigationCheck::Unknown(format!("KSM status unknown: {other}")),
+    }
+}
+
 fn resolve_asset_path(env_var: &str, default_rel: &str) -> PathBuf {
     if let Ok(val) = std::env::var(env_var) {
         return PathBuf::from(val);
@@ -252,4 +367,78 @@ fn inspect_magic(path: &Path) -> &'static str {
         }
     }
     "ext4 Virtual Disk"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MitigationCheck, classify_ksm, classify_smt, vulnerability_unmitigated};
+
+    #[test]
+    fn smt_active_one_fails() {
+        assert!(matches!(
+            classify_smt(Some("1\n"), Some("on\n")),
+            MitigationCheck::Fail(_)
+        ));
+    }
+
+    #[test]
+    fn smt_active_zero_passes() {
+        assert!(matches!(
+            classify_smt(Some("0\n"), Some("on\n")),
+            MitigationCheck::Pass(_)
+        ));
+    }
+
+    #[test]
+    fn smt_control_off_passes_without_active() {
+        assert!(matches!(
+            classify_smt(None, Some("off")),
+            MitigationCheck::Pass(_)
+        ));
+        assert!(matches!(
+            classify_smt(None, Some("forceoff")),
+            MitigationCheck::Pass(_)
+        ));
+        assert!(matches!(
+            classify_smt(None, Some("notsupported")),
+            MitigationCheck::Pass(_)
+        ));
+    }
+
+    #[test]
+    fn smt_control_on_fails_without_active() {
+        assert!(matches!(
+            classify_smt(None, Some("on")),
+            MitigationCheck::Fail(_)
+        ));
+    }
+
+    #[test]
+    fn smt_missing_is_unknown() {
+        assert!(matches!(
+            classify_smt(None, None),
+            MitigationCheck::Unknown(_)
+        ));
+    }
+
+    #[test]
+    fn vuln_vulnerable_prefix_fails() {
+        assert!(vulnerability_unmitigated("Vulnerable\n"));
+        assert!(vulnerability_unmitigated("Vulnerable: No microcode"));
+        assert!(!vulnerability_unmitigated(
+            "Mitigation: PTE Inversion; VMX: SMT vulnerable"
+        ));
+        assert!(!vulnerability_unmitigated("Not affected"));
+        assert!(!vulnerability_unmitigated("Mitigation: PTI"));
+    }
+
+    #[test]
+    fn ksm_zero_or_absent_passes() {
+        assert!(matches!(classify_ksm(None), MitigationCheck::Pass(_)));
+        assert!(matches!(
+            classify_ksm(Some("0\n")),
+            MitigationCheck::Pass(_)
+        ));
+        assert!(matches!(classify_ksm(Some("1")), MitigationCheck::Fail(_)));
+    }
 }

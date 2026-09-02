@@ -127,5 +127,5 @@ When deploying Cratera in production environments:
 2. **Apply Host Microcode Updates**: Ensure host CPU firmware is patched against known speculative execution vulnerabilities.
 3. **Use Long API Keys**: Ensure `CRATERA_INTERNAL_KEY` is at least 32 cryptographically random alphanumeric characters.
 4. **Isolate Work Directories on Dedicated NVMe**: Mount `/var/tmp/cratera` on a fast, non-tmpfs partition to ensure fast hardlinking without consuming host RAM.
-5. **Disable SMT for High-Assurance Tenants**: On multi-tenant cloud instances, disable hyperthreading or pin microVMs to dedicated physical cores.
+5. **Disable SMT and keep CPU mitigations on**: `cratera doctor` fails if Hyper-Threading is enabled, KSM is on, or `/sys/devices/system/cpu/vulnerabilities/*` reports `Vulnerable`. Fix with `nosmt`, microcode/kernel updates, and `echo 0 > /sys/kernel/mm/ksm/run`.
 6. **Zero-Trust Network Ingress**: Route all submissions through an encrypted Zero-Trust tunnel (such as Cloudflare Tunnels with Service Tokens or a Tailscale/WireGuard private mesh) with 0 open inbound ports on the public firewall.
