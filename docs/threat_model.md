@@ -86,6 +86,27 @@ Cratera assumes that the user-submitted code is **active, adversarial, and fully
   * Jailer/Firecracker and guest compile/run start from a cleared environment. The guest then gets only what it needs to run (`PATH`, `HOME`, `TMPDIR`, XDG dirs).
   * Anything you put in submitted code is still visible to the guest; do not put secrets there.
 
+### 3.6 Management Plane (Coordinator, API Key, Host Admin)
+
+* **Threat**: Stolen `CRATERA_INTERNAL_KEY`, a compromised Cratera coordinator, or a host administrator acting as root. The coordinator runs as root so it can open `/dev/kvm` and start Jailer.
+* **In scope**:
+  * Production refuses placeholder/short API keys and non-loopback `CRATERA_BIND`.
+  * A leaked key is not enough by itself if the API stays on loopback and ingress is Zero Trust (Cloudflare Tunnel, Tailscale/WireGuard, or a local reverse proxy). The attacker still needs a path to `127.0.0.1:3100`. Keep it that way; do not bind `0.0.0.0`.
+  * Still **rotate the key** and restart the unit if it may have leaked.
+  * `job_record` logs give an audit trail of language, verdict, and timings; they are not an IDS.
+* **Out of scope**: A compromised host root or coordinator process. Isolation does not protect against the operator of the box. Rebuild the host.
+
+### 3.7 Supply Chain (Images, CI, Updates)
+
+* **Threat**: A swapped or backdoored guest kernel, rootfs, Firecracker binary, or a malicious CI job that publishes those artifacts.
+* **In scope**:
+  * `*.sha256` sidecars for kernel and rootfs. Production `serve` / `cratera doctor` refuse a missing or mismatched checksum (bit-rot, truncated copy, accidental swap).
+  * An attacker who can write both the image and the sidecar defeats this. There is no separate signing key.
+* **Operator assumptions** (not enforced by Cratera):
+  * Patch the host kernel, CPU microcode, and Firecracker/Jailer binaries on a regular cadence and when CVEs land.
+  * Rebuild rootfs from `languages.toml` after toolchain or base-image updates.
+  * Treat `/opt/cratera` artifacts as versioned installs, not files edited in place on the judge.
+
 ---
 
 ## 4. Inherent Limitations of Firecracker & Hardware Virtualization
@@ -122,9 +143,12 @@ While Firecracker microVMs provide significantly stronger isolation than contain
 | **Host Kernel Syscall Exploit** | Critical | Isolated inside guest Linux kernel; no host syscalls exposed | Negligible |
 | **Network Data Exfiltration** | Critical | Zero network devices attached; host firewall drops | None |
 | **Cross-Job State Pollution** | High | Ephemeral VM lifecycle; read-only rootfs; RAM tmpfs | None |
-| **Host CPU / Memory Starvation** | High | Host cgroups v2 (`memory.max`, `pids.max`); atomic `cgroup.kill` | Negligible |
+| **Host CPU / Memory Starvation** | High | Host cgroups v2 (`memory.max`, `cpu.max`, `pids.max`); one VM at a time | Negligible |
 | **Host env leaked into guest/VMM** | Critical | No host env injected; guest gets only PATH/HOME/TMPDIR/XDG | None for host env; total if secrets are in submitted source |
-| **SMT Cross-Thread Cache Timing** | Low | Core pinning; optional host `nosmt` configuration | Low |
+| **Stolen `CRATERA_INTERNAL_KEY`** | High | Loopback bind + Zero Trust ingress; placeholder keys refused | Key alone cannot reach the API; rotate it anyway |
+| **Compromised coordinator / host root** | Critical | None (trusted computing base) | Total |
+| **Swapped kernel/rootfs** | Critical | SHA-256 sidecar checked at production start | High if attacker also replaces `*.sha256` |
+| **SMT Cross-Thread Cache Timing** | Low | `cratera doctor` fails if SMT is on; optional host `nosmt` | Low |
 | **KVM Hypervisor Escape 0-Day** | Critical | Minimal device surface; unprivileged Jailer UID 20001 chroot | Low |
 
 ---
@@ -140,3 +164,5 @@ When deploying Cratera in production environments:
 5. **Disable SMT and keep CPU mitigations on**: `cratera doctor` fails if Hyper-Threading is enabled, KSM is on, or `/sys/devices/system/cpu/vulnerabilities/*` reports `Vulnerable`. Fix with `nosmt`, microcode/kernel updates, and `echo 0 > /sys/kernel/mm/ksm/run`.
 6. **Zero-Trust Network Ingress**: Route all submissions through an encrypted Zero-Trust tunnel (such as Cloudflare Tunnels with Service Tokens or a Tailscale/WireGuard private mesh) with 0 open inbound ports on the public firewall.
 7. **Guest image checksums**: `fetch-runtime.sh` / `build-rootfs.sh` write `*.sha256` next to the kernel and rootfs. Production `serve` and `cratera doctor` refuse a missing or mismatched checksum.
+8. **Rotate the API key** if it may have leaked, and keep Zero Trust / localhost ingress so a stolen key cannot be used from the public internet. Restart `cratera.service` after changing `CRATERA_INTERNAL_KEY`.
+9. **Patch the TCB**: host kernel, microcode, Firecracker/Jailer, and rebuild the rootfs when toolchains or CVEs require it. Cratera does not apply those updates itself.
