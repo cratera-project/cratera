@@ -65,6 +65,12 @@ pub const ALL_SETTINGS: &[SettingDef] = &[
         category: "Host Sandbox & Jailer Limits",
     },
     SettingDef {
+        key: "CRATERA_JAIL_CPU_MAX",
+        description: "Host cgroup cpu.max per Firecracker process (quota period_us)",
+        default_val: "200000 100000",
+        category: "Host Sandbox & Jailer Limits",
+    },
+    SettingDef {
         key: "CRATERA_JAIL_PIDS_MAX",
         description: "Host cgroup pids.max process limit per VM",
         default_val: "64",

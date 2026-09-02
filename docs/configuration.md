@@ -17,6 +17,7 @@ Cratera is configured through environment variables or a `.env` file located in 
 | `CRATERA_VCPU` | `2` | Number of virtual CPU cores allocated per microVM. |
 | `CRATERA_MEM_MIB` | `2048` | Guest RAM memory allocated per microVM, in MiB. |
 | `CRATERA_JAIL_MEM_MAX` | `3221225472` | Host cgroup `memory.max` limit per Firecracker process (3 GiB in bytes). |
+| `CRATERA_JAIL_CPU_MAX` | `{CRATERA_VCPU} × 100000 100000` | Host cgroup `cpu.max` (`quota period`). Default is one period of quota per vCPU (2 vCPUs → `200000 100000`). |
 | `CRATERA_JAIL_PIDS_MAX` | `64` | Host cgroup `pids.max` limit per microVM. |
 | `CRATERA_FIRECRACKER` | `./images/firecracker` | Path to the Firecracker binary. |
 | `CRATERA_JAILER` | `./images/jailer` | Path to the Jailer binary. |

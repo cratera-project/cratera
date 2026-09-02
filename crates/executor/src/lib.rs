@@ -23,6 +23,14 @@ const POWEROFF_GRACE: Duration = Duration::from_secs(3);
 const SNAP_WAIT: Duration = Duration::from_secs(60);
 const SNAP_CREATE_WAIT: Duration = Duration::from_secs(180);
 const JAIL_MEMORY_MAX: &str = "3221225472";
+const CPU_PERIOD_US: u32 = 100_000;
+
+fn jail_cpu_max_value(vcpu: u8, override_val: Option<&str>) -> String {
+    if let Some(v) = override_val.map(str::trim).filter(|s| !s.is_empty()) {
+        return v.to_string();
+    }
+    format!("{} {CPU_PERIOD_US}", u32::from(vcpu.max(1)) * CPU_PERIOD_US)
+}
 const SNAP_MEMORY_MAX: &str = "6442450944";
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(3);
@@ -333,6 +341,7 @@ pub struct ExecutorConfig {
     pub mem_mib: u32,
     pub compile_timeout: Duration,
     pub jail_mem_max: String,
+    pub jail_cpu_max: String,
     pub jail_pids_max: u32,
     pub languages: LanguageRegistry,
 }
@@ -385,6 +394,8 @@ impl ExecutorConfig {
             .unwrap_or(12);
         let jail_mem_max =
             std::env::var("CRATERA_JAIL_MEM_MAX").unwrap_or_else(|_| JAIL_MEMORY_MAX.into());
+        let jail_cpu_max =
+            jail_cpu_max_value(vcpu, std::env::var("CRATERA_JAIL_CPU_MAX").ok().as_deref());
         let jail_pids_max = std::env::var("CRATERA_JAIL_PIDS_MAX")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -417,6 +428,7 @@ impl ExecutorConfig {
             mem_mib,
             compile_timeout: Duration::from_secs(compile_timeout_secs),
             jail_mem_max,
+            jail_cpu_max,
             jail_pids_max,
             languages: LanguageRegistry::from_env_or_file(),
         }
@@ -997,6 +1009,8 @@ fn spawn_vm(
             "--cgroup",
             &format!("memory.max={mem_max}"),
             "--cgroup",
+            &format!("cpu.max={}", cfg.jail_cpu_max),
+            "--cgroup",
             &format!("pids.max={}", cfg.jail_pids_max),
             "--seccomp-level",
             "2",
@@ -1478,5 +1492,12 @@ mod tests {
         let events = "low 0\nhigh 1\nmax 0\noom 2\noom_kill 3\n";
         assert_eq!(cgroup_key_u64(events, "oom_kill"), Some(3));
         assert_eq!(cgroup_key_u64(events, "missing"), None);
+    }
+
+    #[test]
+    fn jail_cpu_max_follows_vcpu_or_override() {
+        assert_eq!(jail_cpu_max_value(2, None), "200000 100000");
+        assert_eq!(jail_cpu_max_value(1, None), "100000 100000");
+        assert_eq!(jail_cpu_max_value(2, Some("50000 100000")), "50000 100000");
     }
 }

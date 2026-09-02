@@ -73,7 +73,8 @@ Cratera assumes that the user-submitted code is **active, adversarial, and fully
 * **Threat**: Malicious code spawns thousands of threads (`while(1) fork()`) or allocates hundreds of gigabytes of RAM.
 * **Mitigation**:
   * **Guest Resource Caps**: MicroVM is allocated fixed hardware resources (2 vCPUs, 2 GiB RAM).
-  * **Host cgroups v2 Limits**: Firecracker Jailer enforces `memory.max=3221225472` (3 GB) and `pids.max=64` on the host VMM process.
+  * **Host cgroups v2 Limits**: Firecracker Jailer enforces `memory.max` (3 GiB), `cpu.max` (one period of quota per vCPU), and `pids.max=64` on the host VMM process. The coordinator runs **one microVM at a time**; it does not overcommit CPU or memory across jobs.
+  * **I/O**: Guest disks are read-only virtio-block; there is no extra `io.max` throttle (that needs a host device major:minor).
   * **Strict Timeouts**: Guest agent enforces execution timeouts via `pidfd_send_signal` (SIGKILL). Host coordinator enforces hard wall-clock timeouts.
   * **Atomic Process Reaping**: Host uses `cgroup.kill` to instantly terminate all descendant processes in O(1) time.
 
