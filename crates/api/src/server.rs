@@ -285,6 +285,7 @@ pub async fn harness(
         _ => (source, state.run_timeout_ms),
     };
     let time_ms = time_ms.min(state.max_time_ms);
+    let language = resolved_lang.key.clone();
     let t0 = Instant::now();
     match state
         .executor
@@ -292,33 +293,48 @@ pub async fn harness(
         .await
     {
         Ok(outcome) => {
+            let compile_ms = outcome.job.compile_ms;
+            let timed_out = outcome.job.timed_out;
+            let oom = outcome.job.oom;
+            let run_us = outcome.job.run_ms;
+            let rss_kb = outcome.job.run_rss_kb;
+            let result = HarnessResult::from_job(outcome.job, outcome.wall_ms).with_host_timings(
+                compile_ms,
+                outcome.copy_ms,
+                outcome.boot_ms,
+                outcome.wall_ms,
+                outcome.restored,
+            );
             info!(
+                job_id = %outcome.job_id,
+                language = %outcome.language,
+                verdict = %result.verdict,
+                timed_out,
+                oom,
                 copy_ms = outcome.copy_ms,
                 boot_ms = outcome.boot_ms,
-                compile_ms = outcome.job.compile_ms,
-                run_us = outcome.job.run_ms,
+                compile_ms,
+                run_us,
                 wall_ms = outcome.wall_ms,
                 http_ms = t0.elapsed().as_millis() as u64,
                 restored = outcome.restored,
-                "harness done"
+                rss_kb,
+                cgroup_usage_usec = outcome.cgroup.usage_usec.unwrap_or(0),
+                cgroup_memory_peak = outcome.cgroup.memory_peak.unwrap_or(0),
+                cgroup_oom_kill = outcome.cgroup.oom_kill.unwrap_or(0),
+                "job_record"
             );
-            let compile_ms = outcome.job.compile_ms;
-            Ok(Json(
-                HarnessResult::from_job(outcome.job, outcome.wall_ms).with_host_timings(
-                    compile_ms,
-                    outcome.copy_ms,
-                    outcome.boot_ms,
-                    outcome.wall_ms,
-                    outcome.restored,
-                ),
+            Ok(Json(result))
+        }
+        Err(ExecError::Busy) => {
+            tracing::warn!(language = %language, "job_record");
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error":"busy","unavailable":true})),
             ))
         }
-        Err(ExecError::Busy) => Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error":"busy","unavailable":true})),
-        )),
         Err(ExecError::Failed(msg)) => {
-            tracing::error!(error = %msg, "harness job failed");
+            tracing::error!(language = %language, error = %msg, "job_record");
             Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({"error":"judge failed","unavailable":true})),

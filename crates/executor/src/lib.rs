@@ -35,13 +35,23 @@ pub enum ExecError {
     Failed(String),
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct CgroupStats {
+    pub usage_usec: Option<u64>,
+    pub memory_peak: Option<u64>,
+    pub oom_kill: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct JobOutcome {
     pub job: JobResponse,
+    pub job_id: String,
+    pub language: String,
     pub copy_ms: u64,
     pub boot_ms: u64,
     pub wall_ms: u64,
     pub restored: bool,
+    pub cgroup: CgroupStats,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -753,13 +763,17 @@ fn run_vm(
     let died = child.try_wait().ok().flatten();
     let oom = died.and_then(|s| s.signal()) == Some(9);
     let wall_ms = wall_start.elapsed().as_millis() as u64;
+    let cgroup = read_cgroup_stats(&layout.id);
     let mapped = match rpc {
         Ok(job) => Ok(JobOutcome {
             job,
+            job_id: layout.id.clone(),
+            language: lang.key.clone(),
             copy_ms,
             boot_ms,
             wall_ms,
             restored: restore,
+            cgroup: cgroup.clone(),
         }),
         Err(_) if wall_start.elapsed() >= wall => Ok(JobOutcome {
             job: JobResponse {
@@ -768,10 +782,13 @@ fn run_vm(
                 run_ms: wall_start.elapsed().as_micros() as u64,
                 ..Default::default()
             },
+            job_id: layout.id.clone(),
+            language: lang.key.clone(),
             copy_ms,
             boot_ms,
             wall_ms,
             restored: restore,
+            cgroup: cgroup.clone(),
         }),
         Err(_) if oom => Ok(JobOutcome {
             job: JobResponse {
@@ -780,25 +797,16 @@ fn run_vm(
                 run_ms: wall_start.elapsed().as_micros() as u64,
                 ..Default::default()
             },
+            job_id: layout.id.clone(),
+            language: lang.key.clone(),
             copy_ms,
             boot_ms,
             wall_ms,
             restored: restore,
+            cgroup,
         }),
         Err(e) => Err(e),
     };
-    if let Ok(o) = &mapped {
-        info!(
-            job = %layout.id,
-            copy_ms = o.copy_ms,
-            boot_ms = o.boot_ms,
-            compile_ms = o.job.compile_ms,
-            run_us = o.job.run_ms,
-            wall_ms = o.wall_ms,
-            restored = o.restored,
-            "harness phases"
-        );
-    }
     let _ = tx.send(mapped.clone());
 
     let reap_t0 = Instant::now();
@@ -1045,6 +1053,40 @@ const CGROUP_BASES: &[&str] = &[
     "/sys/fs/cgroup/jailer",
     "/sys/fs/cgroup",
 ];
+
+fn cgroup_key_u64(text: &str, key: &str) -> Option<u64> {
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        if parts.next() == Some(key) {
+            return parts.next().and_then(|s| s.parse().ok());
+        }
+    }
+    None
+}
+
+fn read_cgroup_u64(dir: &Path, file: &str) -> Option<u64> {
+    fs::read_to_string(dir.join(file)).ok()?.trim().parse().ok()
+}
+
+fn read_cgroup_stats(job_id: &str) -> CgroupStats {
+    for base in CGROUP_BASES {
+        let dir = Path::new(base).join(job_id);
+        if !dir.is_dir() {
+            continue;
+        }
+        let cpu = fs::read_to_string(dir.join("cpu.stat")).ok();
+        let events = fs::read_to_string(dir.join("memory.events")).ok();
+        return CgroupStats {
+            usage_usec: cpu.as_deref().and_then(|t| cgroup_key_u64(t, "usage_usec")),
+            memory_peak: read_cgroup_u64(&dir, "memory.peak")
+                .or_else(|| read_cgroup_u64(&dir, "memory.current")),
+            oom_kill: events
+                .as_deref()
+                .and_then(|t| cgroup_key_u64(t, "oom_kill")),
+        };
+    }
+    CgroupStats::default()
+}
 
 fn reap_vm(layout: &JobLayout, child: &mut Child) {
     let _ = child.kill();
@@ -1427,5 +1469,14 @@ mod tests {
         assert!(registry.resolve(Some("brainfuck")).is_none());
         assert!(registry.resolve(Some("unknown_lang")).is_none());
         assert!(registry.resolve(Some("nonexistent_language_xyz")).is_none());
+    }
+
+    #[test]
+    fn cgroup_key_u64_parses_stat_and_events() {
+        let cpu = "usage_usec 12345\nuser_usec 100\nsystem_usec 50\n";
+        assert_eq!(cgroup_key_u64(cpu, "usage_usec"), Some(12345));
+        let events = "low 0\nhigh 1\nmax 0\noom 2\noom_kill 3\n";
+        assert_eq!(cgroup_key_u64(events, "oom_kill"), Some(3));
+        assert_eq!(cgroup_key_u64(events, "missing"), None);
     }
 }

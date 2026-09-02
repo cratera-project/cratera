@@ -335,6 +335,7 @@ Or manage it directly with systemctl:
 ```bash
 sudo systemctl status cratera.service
 sudo journalctl -u cratera.service -f
+sudo journalctl -u cratera.service --grep job_record
 sudo systemctl restart cratera.service
 ```
 

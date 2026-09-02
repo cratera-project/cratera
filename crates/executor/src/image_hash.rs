@@ -53,8 +53,7 @@ pub fn verify_image(path: &Path) -> Result<(), ImageHashError> {
     let sidecar = sidecar_path(path);
     let text = std::fs::read_to_string(&sidecar)
         .map_err(|_| ImageHashError::MissingSidecar(sidecar.clone()))?;
-    let expected =
-        parse_sha256_text(&text).ok_or(ImageHashError::InvalidSidecar(sidecar))?;
+    let expected = parse_sha256_text(&text).ok_or(ImageHashError::InvalidSidecar(sidecar))?;
     let actual = sha256_file(path)?;
     if expected != actual {
         return Err(ImageHashError::Mismatch(path.to_path_buf()));

@@ -101,6 +101,28 @@ sudo journalctl -u cratera.service -f
 sudo systemctl restart cratera.service
 ```
 
+### Per-job log (`job_record`)
+
+Each finished harness job emits one structured tracing event named `job_record` (info on success, warn on busy, error on judge failure). It does not include stdout/stderr.
+
+Fields:
+
+| Field | Meaning |
+| :--- | :--- |
+| `job_id` | Jailer/Firecracker id (`job-N`) |
+| `language` | Resolved language key |
+| `verdict` | `AC`, `WA`, `TLE`, `MLE`, `RE`, `CE` |
+| `timed_out` / `oom` | Guest timeout or SIGKILL/OOM |
+| `copy_ms` / `boot_ms` / `compile_ms` / `run_us` / `wall_ms` / `http_ms` | Host and guest timings |
+| `rss_kb` | Guest `RssAnon` |
+| `cgroup_usage_usec` / `cgroup_memory_peak` / `cgroup_oom_kill` | Host cgroup snapshot taken before the VM is reaped (`0` if the cgroup was not found, e.g. Jailer off) |
+
+`run_us` is guest CPU/run time in microseconds; `wall_ms` is host wall clock for the whole job (copy + boot + compile + run). A large `wall_ms` with a small `run_us` is the usual sleep/evasion pattern.
+
+```bash
+journalctl -u cratera.service --grep job_record
+```
+
 ---
 
 ## Ingress Options (Optional)
