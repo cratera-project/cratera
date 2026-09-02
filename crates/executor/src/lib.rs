@@ -13,6 +13,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Semaphore, oneshot};
 use tracing::{info, warn};
 
+mod image_hash;
+pub use image_hash::{ImageHashError, verify_image};
+
 const GUEST_VCPU: u8 = 2;
 const GUEST_MEM_MIB: u32 = 2048;
 const BOOT_WAIT: Duration = Duration::from_secs(20);
@@ -407,6 +410,22 @@ impl ExecutorConfig {
             jail_pids_max,
             languages: LanguageRegistry::from_env_or_file(),
         }
+    }
+
+    pub fn verify_guest_images(&self, require_checksums: bool) -> Result<(), String> {
+        for (label, path) in [("kernel", &self.kernel), ("rootfs", &self.rootfs)] {
+            match verify_image(path) {
+                Ok(()) => {}
+                Err(ImageHashError::MissingSidecar(_)) if !require_checksums => {
+                    warn!(
+                        image = %path.display(),
+                        "{label} checksum file missing; skip (not production)"
+                    );
+                }
+                Err(e) => return Err(format!("{label}: {e}")),
+            }
+        }
+        Ok(())
     }
 }
 

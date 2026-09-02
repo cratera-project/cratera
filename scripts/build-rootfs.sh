@@ -94,3 +94,4 @@ else
 fi
 
 echo "==> Rootfs build complete: $ROOTFS_OUT ($(du -h "$ROOTFS_OUT" | awk '{print $1}') on disk)"
+sha256sum "$ROOTFS_OUT" | awk '{print $1}' > "${ROOTFS_OUT}.sha256"

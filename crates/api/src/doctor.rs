@@ -1,3 +1,4 @@
+use cratera_executor::{ImageHashError, verify_image};
 use std::fs;
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
@@ -147,6 +148,7 @@ pub fn run_doctor() -> anyhow::Result<()> {
             kernel_path.display(),
             size_mb
         );
+        report_image_checksum("kernel", &kernel_path, production, &mut all_ok);
     } else {
         all_ok = false;
         println!(
@@ -169,6 +171,7 @@ pub fn run_doctor() -> anyhow::Result<()> {
             size_mb,
             fs_type
         );
+        report_image_checksum("rootfs", &path, production, &mut all_ok);
     } else {
         all_ok = false;
         println!("  {RED}✗{RESET} Rootfs image missing (searched rootfs.squashfs, rootfs.ext4)");
@@ -420,6 +423,28 @@ fn classify_owner_drop(bin: &str, uid: u32, code: Option<i32>, stderr: &str) -> 
 fn owner_drop_denied(stderr: &str) -> bool {
     let s = stderr.to_ascii_lowercase();
     s.contains("permission") || s.contains("must be root") || s.contains("operation not permitted")
+}
+
+fn report_image_checksum(label: &str, path: &Path, production: bool, all_ok: &mut bool) {
+    match verify_image(path) {
+        Ok(()) => println!("  {GREEN}✓{RESET} {label} SHA-256 checksum matches"),
+        Err(ImageHashError::MissingSidecar(_)) if !production => {
+            println!(
+                "  {YELLOW}!{RESET} {label} checksum file missing ({}.sha256)",
+                path.display()
+            );
+            println!(
+                "    {DIM}Fix: re-run ./scripts/fetch-runtime.sh or ./scripts/build-rootfs.sh{RESET}"
+            );
+        }
+        Err(e) => {
+            *all_ok = false;
+            println!("  {RED}✗{RESET} {label} checksum: {e}");
+            println!(
+                "    {DIM}Fix: re-run ./scripts/fetch-runtime.sh or ./scripts/build-rootfs.sh{RESET}"
+            );
+        }
+    }
 }
 
 fn resolve_asset_path(env_var: &str, default_rel: &str) -> PathBuf {

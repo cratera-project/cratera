@@ -66,3 +66,8 @@ fi
 echo "ok: $IMG/firecracker $IMG/jailer $IMG/vmlinux.bin"
 ls -lh firecracker jailer vmlinux.bin
 ./firecracker --version || true
+for f in firecracker jailer vmlinux.bin; do
+  if [[ -f "$f" ]]; then
+    sha256sum "$f" | awk '{print $1}' > "${f}.sha256"
+  fi
+done

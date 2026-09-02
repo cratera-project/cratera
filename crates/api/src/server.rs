@@ -195,6 +195,8 @@ pub async fn start_server() -> anyhow::Result<()> {
     if production && !cfg.use_jailer {
         anyhow::bail!("Jailer required in production (CRATERA_USE_JAILER=0 is set)");
     }
+    cfg.verify_guest_images(production)
+        .map_err(|e| anyhow::anyhow!("guest image checksum: {e}"))?;
     tokio::fs::create_dir_all(&cfg.work_dir)
         .await
         .context("create work dir")?;

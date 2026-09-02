@@ -138,3 +138,4 @@ When deploying Cratera in production environments:
 4. **Isolate Work Directories on Dedicated NVMe**: Mount `/var/tmp/cratera` on a fast, non-tmpfs partition to ensure fast hardlinking without consuming host RAM.
 5. **Disable SMT and keep CPU mitigations on**: `cratera doctor` fails if Hyper-Threading is enabled, KSM is on, or `/sys/devices/system/cpu/vulnerabilities/*` reports `Vulnerable`. Fix with `nosmt`, microcode/kernel updates, and `echo 0 > /sys/kernel/mm/ksm/run`.
 6. **Zero-Trust Network Ingress**: Route all submissions through an encrypted Zero-Trust tunnel (such as Cloudflare Tunnels with Service Tokens or a Tailscale/WireGuard private mesh) with 0 open inbound ports on the public firewall.
+7. **Guest image checksums**: `fetch-runtime.sh` / `build-rootfs.sh` write `*.sha256` next to the kernel and rootfs. Production `serve` and `cratera doctor` refuse a missing or mismatched checksum.
