@@ -1012,7 +1012,8 @@ fn spawn_vm(
         }
         c
     };
-    cmd.stdin(Stdio::null())
+    cmd.env_clear()
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

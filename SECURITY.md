@@ -9,6 +9,7 @@
 3. The guest microVM has **no network interfaces** (no TAP devices or bridged NICs). Guest code cannot communicate with the host network or the internet.
 4. Communication between host and guest is strictly point-to-point via Firecracker `vsock` framing.
 5. Each microVM runs exactly one job and is immediately halted (`reboot(RB_POWER_OFF)`), killed, and reaped.
+6. Cratera does not inject host environment variables into the guest. Jailer, Firecracker, and guest processes start from a cleared environment; the guest then gets only `PATH`, `HOME`, `TMPDIR`, and XDG dirs. Do not put secrets in submitted source.
 
 For an in-depth security analysis, threat matrix, Firecracker hardware limitations, and production hardening checklist, see [docs/threat_model.md](docs/threat_model.md).
 

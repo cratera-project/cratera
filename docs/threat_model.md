@@ -77,6 +77,14 @@ Cratera assumes that the user-submitted code is **active, adversarial, and fully
   * **Strict Timeouts**: Guest agent enforces execution timeouts via `pidfd_send_signal` (SIGKILL). Host coordinator enforces hard wall-clock timeouts.
   * **Atomic Process Reaping**: Host uses `cgroup.kill` to instantly terminate all descendant processes in O(1) time.
 
+### 3.5 Secret Exposure & Misuse
+
+* **Threat**: Host environment (including `CRATERA_INTERNAL_KEY`) or other platform credentials reach the Jailer, Firecracker, or guest process.
+* **Mitigation**:
+  * Cratera does NOT inject host environment variables into the guest.
+  * Jailer/Firecracker and guest compile/run start from a cleared environment. The guest then gets only what it needs to run (`PATH`, `HOME`, `TMPDIR`, XDG dirs).
+  * Anything you put in submitted code is still visible to the guest; do not put secrets there.
+
 ---
 
 ## 4. Inherent Limitations of Firecracker & Hardware Virtualization
@@ -114,6 +122,7 @@ While Firecracker microVMs provide significantly stronger isolation than contain
 | **Network Data Exfiltration** | Critical | Zero network devices attached; host firewall drops | None |
 | **Cross-Job State Pollution** | High | Ephemeral VM lifecycle; read-only rootfs; RAM tmpfs | None |
 | **Host CPU / Memory Starvation** | High | Host cgroups v2 (`memory.max`, `pids.max`); atomic `cgroup.kill` | Negligible |
+| **Host env leaked into guest/VMM** | Critical | No host env injected; guest gets only PATH/HOME/TMPDIR/XDG | None for host env; total if secrets are in submitted source |
 | **SMT Cross-Thread Cache Timing** | Low | Core pinning; optional host `nosmt` configuration | Low |
 | **KVM Hypervisor Escape 0-Day** | Critical | Minimal device surface; unprivileged Jailer UID 20001 chroot | Low |
 
@@ -125,7 +134,7 @@ When deploying Cratera in production environments:
 
 1. **Enable Firecracker Jailer**: Set `CRATERA_USE_JAILER=1` in `.env` to enforce UID 20001 dropped privileges and chroot containment.
 2. **Apply Host Microcode Updates**: Ensure host CPU firmware is patched against known speculative execution vulnerabilities.
-3. **Use Long API Keys**: Ensure `CRATERA_INTERNAL_KEY` is at least 32 cryptographically random alphanumeric characters.
+3. **Use Long API Keys**: Ensure `CRATERA_INTERNAL_KEY` is at least 32 cryptographically random alphanumeric characters. Cratera does not inject host env into the guest; do not put secrets in submitted source.
 4. **Isolate Work Directories on Dedicated NVMe**: Mount `/var/tmp/cratera` on a fast, non-tmpfs partition to ensure fast hardlinking without consuming host RAM.
 5. **Disable SMT and keep CPU mitigations on**: `cratera doctor` fails if Hyper-Threading is enabled, KSM is on, or `/sys/devices/system/cpu/vulnerabilities/*` reports `Vulnerable`. Fix with `nosmt`, microcode/kernel updates, and `echo 0 > /sys/kernel/mm/ksm/run`.
 6. **Zero-Trust Network Ingress**: Route all submissions through an encrypted Zero-Trust tunnel (such as Cloudflare Tunnels with Service Tokens or a Tailscale/WireGuard private mesh) with 0 open inbound ports on the public firewall.

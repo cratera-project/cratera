@@ -310,6 +310,7 @@ fn run_cmd(mut cmd: Command, timeout: Duration, sample_rss: bool) -> CmdOut {
     };
 
     let mut child = match cmd
+        .env_clear()
         .env("PATH", "/usr/local/bin:/usr/bin:/bin")
         .env("HOME", "/tmp")
         .env("TMPDIR", "/tmp")
