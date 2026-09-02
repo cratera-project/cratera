@@ -174,8 +174,10 @@ pub async fn start_server() -> anyhow::Result<()> {
             "dev-key".into()
         });
     let production = std::env::var("NODE_ENV").as_deref() == Ok("production");
-    if key.len() < 16 && production {
-        anyhow::bail!("CRATERA_INTERNAL_KEY must be at least 16 characters in production");
+    if production && api_key_unfit_for_production(&key) {
+        anyhow::bail!(
+            "CRATERA_INTERNAL_KEY is a placeholder or shorter than 16 characters; set a random production key"
+        );
     }
 
     let run_ms = std::env::var("CRATERA_RUN_MS")
@@ -356,6 +358,11 @@ fn bearer_ok(headers: &HeaderMap, expected: &str) -> bool {
     keys_match(got.as_bytes(), expected.as_bytes())
 }
 
+pub(crate) fn api_key_unfit_for_production(key: &str) -> bool {
+    let k = key.trim();
+    k.len() < 16 || k.to_ascii_lowercase().starts_with("dev-key")
+}
+
 fn keys_match(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -368,4 +375,19 @@ fn keys_match(a: &[u8], b: &[u8]) -> bool {
 
 fn json_err(status: StatusCode, message: &str) -> (StatusCode, Json<serde_json::Value>) {
     (status, Json(serde_json::json!({"error": message})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::api_key_unfit_for_production;
+
+    #[test]
+    fn rejects_short_and_example_keys() {
+        assert!(api_key_unfit_for_production("dev-key"));
+        assert!(api_key_unfit_for_production("dev-key-change-me-please"));
+        assert!(api_key_unfit_for_production("short"));
+        assert!(!api_key_unfit_for_production(
+            "a-sufficiently-long-random-token"
+        ));
+    }
 }

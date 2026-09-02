@@ -69,6 +69,16 @@ pub fn run_doctor() -> anyhow::Result<()> {
         println!("  {GREEN}✓{RESET} Jailer enabled");
     }
     check_bind_address(production, &mut all_ok);
+    let key = std::env::var("CRATERA_INTERNAL_KEY")
+        .or_else(|_| std::env::var("GRADE_INTERNAL_KEY"))
+        .unwrap_or_else(|_| "dev-key".into());
+    if production && crate::server::api_key_unfit_for_production(&key) {
+        all_ok = false;
+        println!(
+            "  {RED}✗{RESET} CRATERA_INTERNAL_KEY is a placeholder or shorter than 16 characters"
+        );
+        println!("    {DIM}Fix: set a long random Bearer key (not the .env.example value){RESET}");
+    }
     if production || jailer_on {
         check_jailer_egress_drop(&mut all_ok);
     }

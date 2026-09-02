@@ -9,7 +9,7 @@ Cratera is configured through environment variables or a `.env` file located in 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `CRATERA_BIND` | `127.0.0.1:3100` | Host HTTP API bind address and port. |
-| `CRATERA_INTERNAL_KEY` | *(auto-generated)* | Shared secret for Bearer token authentication (`Authorization: Bearer <key>`). |
+| `CRATERA_INTERNAL_KEY` | `dev-key` | Bearer token. Production refuses placeholders (`dev-key…`) and keys shorter than 16 characters. |
 | `CRATERA_RUN_MS` | `2000` | Execution time limit for standard test runs (`"mode": "run"`), in milliseconds. |
 | `CRATERA_SUBMIT_MS` | `5000` | Execution time limit for formal submissions (`"mode": "submit"`), in milliseconds. |
 | `CRATERA_MAX_TIME_MS` | `10000` | Hard upper ceiling for execution timeouts (ms). |
