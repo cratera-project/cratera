@@ -1,4 +1,5 @@
 use std::fs;
+use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -65,6 +66,10 @@ pub fn run_doctor() -> anyhow::Result<()> {
         );
     } else if jailer_on {
         println!("  {GREEN}✓{RESET} Jailer enabled");
+    }
+    check_bind_address(production, &mut all_ok);
+    if production || jailer_on {
+        check_jailer_egress_drop(&mut all_ok);
     }
     let uid_check = Command::new("id").args(["-u", "20001"]).output();
     match uid_check {
@@ -328,6 +333,95 @@ fn classify_ksm(run: Option<&str>) -> MitigationCheck {
     }
 }
 
+fn check_bind_address(production: bool, all_ok: &mut bool) {
+    let bind = std::env::var("CRATERA_BIND")
+        .or_else(|_| std::env::var("GRADE_BIND"))
+        .unwrap_or_else(|_| "127.0.0.1:3100".into());
+    match bind_is_loopback(&bind) {
+        Some(true) => println!("  {GREEN}✓{RESET} API bind is loopback ({bind})"),
+        Some(false) if production => {
+            *all_ok = false;
+            println!("  {RED}✗{RESET} API bind is not loopback in production ({bind})");
+            println!("    {DIM}Fix: CRATERA_BIND=127.0.0.1:3100{RESET}");
+        }
+        Some(false) => {
+            println!("  {YELLOW}!{RESET} API bind is not loopback ({bind})");
+        }
+        None if production => {
+            *all_ok = false;
+            println!("  {RED}✗{RESET} CRATERA_BIND is not a valid socket address ({bind})");
+        }
+        None => println!("  {YELLOW}!{RESET} CRATERA_BIND is not a valid socket address ({bind})"),
+    }
+}
+
+fn bind_is_loopback(bind: &str) -> Option<bool> {
+    bind.parse::<SocketAddr>()
+        .ok()
+        .map(|addr| addr.ip().is_loopback())
+}
+
+fn check_jailer_egress_drop(all_ok: &mut bool) {
+    let uid = std::env::var("CRATERA_JAIL_UID")
+        .or_else(|_| std::env::var("GRADE_JAIL_UID"))
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(20001);
+    for bin in ["iptables", "ip6tables"] {
+        match owner_drop_check(bin, uid) {
+            MitigationCheck::Pass(msg) => println!("  {GREEN}✓{RESET} {msg}"),
+            MitigationCheck::Fail(msg) => {
+                *all_ok = false;
+                println!("  {RED}✗{RESET} {msg}");
+                println!("    {DIM}Fix: ./scripts/host-setup.sh{RESET}");
+            }
+            MitigationCheck::Unknown(msg) => println!("  {YELLOW}!{RESET} {msg}"),
+        }
+    }
+}
+
+fn owner_drop_check(bin: &str, uid: u32) -> MitigationCheck {
+    match Command::new(bin)
+        .args([
+            "-C",
+            "OUTPUT",
+            "-m",
+            "owner",
+            "--uid-owner",
+            &uid.to_string(),
+            "-j",
+            "DROP",
+        ])
+        .output()
+    {
+        Ok(out) => classify_owner_drop(
+            bin,
+            uid,
+            out.status.code(),
+            &String::from_utf8_lossy(&out.stderr),
+        ),
+        Err(_) => MitigationCheck::Unknown(format!(
+            "{bin} not installed; cannot verify UID {uid} egress DROP"
+        )),
+    }
+}
+
+fn classify_owner_drop(bin: &str, uid: u32, code: Option<i32>, stderr: &str) -> MitigationCheck {
+    match code {
+        Some(0) => MitigationCheck::Pass(format!("{bin} DROP egress for UID {uid}")),
+        Some(1) => MitigationCheck::Fail(format!("{bin} missing OUTPUT owner DROP for UID {uid}")),
+        _ if owner_drop_denied(stderr) => MitigationCheck::Unknown(format!(
+            "cannot verify {bin} UID {uid} egress DROP (need root)"
+        )),
+        _ => MitigationCheck::Unknown(format!("cannot verify {bin} UID {uid} egress DROP")),
+    }
+}
+
+fn owner_drop_denied(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("permission") || s.contains("must be root") || s.contains("operation not permitted")
+}
+
 fn resolve_asset_path(env_var: &str, default_rel: &str) -> PathBuf {
     if let Ok(val) = std::env::var(env_var) {
         return PathBuf::from(val);
@@ -385,7 +479,10 @@ fn inspect_magic(path: &Path) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{MitigationCheck, classify_ksm, classify_smt, vulnerability_unmitigated};
+    use super::{
+        MitigationCheck, bind_is_loopback, classify_ksm, classify_owner_drop, classify_smt,
+        vulnerability_unmitigated,
+    };
 
     #[test]
     fn smt_active_one_fails() {
@@ -454,5 +551,35 @@ mod tests {
             MitigationCheck::Pass(_)
         ));
         assert!(matches!(classify_ksm(Some("1")), MitigationCheck::Fail(_)));
+    }
+
+    #[test]
+    fn loopback_binds() {
+        assert_eq!(bind_is_loopback("127.0.0.1:3100"), Some(true));
+        assert_eq!(bind_is_loopback("[::1]:3100"), Some(true));
+        assert_eq!(bind_is_loopback("0.0.0.0:3100"), Some(false));
+        assert_eq!(bind_is_loopback("[::]:3100"), Some(false));
+        assert_eq!(bind_is_loopback("not-an-addr"), None);
+    }
+
+    #[test]
+    fn owner_drop_exit_codes() {
+        assert!(matches!(
+            classify_owner_drop("iptables", 20001, Some(0), ""),
+            MitigationCheck::Pass(_)
+        ));
+        assert!(matches!(
+            classify_owner_drop("iptables", 20001, Some(1), ""),
+            MitigationCheck::Fail(_)
+        ));
+        assert!(matches!(
+            classify_owner_drop(
+                "iptables",
+                20001,
+                Some(4),
+                "Permission denied (you must be root)"
+            ),
+            MitigationCheck::Unknown(_)
+        ));
     }
 }

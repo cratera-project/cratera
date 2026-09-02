@@ -173,7 +173,8 @@ pub async fn start_server() -> anyhow::Result<()> {
             tracing::warn!("CRATERA_INTERNAL_KEY unset; using development default");
             "dev-key".into()
         });
-    if key.len() < 16 && std::env::var("NODE_ENV").as_deref() == Ok("production") {
+    let production = std::env::var("NODE_ENV").as_deref() == Ok("production");
+    if key.len() < 16 && production {
         anyhow::bail!("CRATERA_INTERNAL_KEY must be at least 16 characters in production");
     }
 
@@ -191,7 +192,7 @@ pub async fn start_server() -> anyhow::Result<()> {
         .unwrap_or(MAX_TIME_MS);
 
     let cfg = ExecutorConfig::from_env();
-    if std::env::var("NODE_ENV").as_deref() == Ok("production") && !cfg.use_jailer {
+    if production && !cfg.use_jailer {
         anyhow::bail!("Jailer required in production (CRATERA_USE_JAILER=0 is set)");
     }
     tokio::fs::create_dir_all(&cfg.work_dir)
@@ -234,6 +235,9 @@ pub async fn start_server() -> anyhow::Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 3100)));
+    if production && !addr.ip().is_loopback() {
+        anyhow::bail!("CRATERA_BIND must be loopback in production (got {addr})");
+    }
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!(%addr, "cratera listening");
