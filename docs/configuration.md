@@ -14,6 +14,9 @@ Cratera is configured through environment variables or a `.env` file located in 
 | `CRATERA_SUBMIT_MS` | `5000` | Execution time limit for formal submissions (`"mode": "submit"`), in milliseconds. |
 | `CRATERA_MAX_TIME_MS` | `10000` | Hard upper ceiling for execution timeouts (ms). |
 | `CRATERA_COMPILE_TIMEOUT_SECS` | `12` | In-guest compilation timeout limit, in seconds. |
+| `CRATERA_MAX_CONCURRENT_JOBS` | `1` | Maximum number of microVM jobs that may execute simultaneously (1–1024). Size this against host CPU and memory. |
+| `CRATERA_MAX_QUEUED_JOBS` | `64` | Maximum submissions waiting for an execution slot (0–100000). Additional submissions fail immediately with `queue_full`. |
+| `CRATERA_QUEUE_TIMEOUT_MS` | `10000` | Maximum queue wait before a submission fails with `queue_timeout`. |
 | `CRATERA_VCPU` | `2` | Number of virtual CPU cores allocated per microVM. |
 | `CRATERA_MEM_MIB` | `2048` | Guest RAM memory allocated per microVM, in MiB. |
 | `CRATERA_JAIL_MEM_MAX` | `3221225472` | Host cgroup `memory.max` limit per Firecracker process (3 GiB in bytes). |
@@ -50,6 +53,9 @@ CRATERA_MEM_MIB=2048
 CRATERA_RUN_MS=2000
 CRATERA_SUBMIT_MS=5000
 CRATERA_COMPILE_TIMEOUT_SECS=12
+CRATERA_MAX_CONCURRENT_JOBS=1
+CRATERA_MAX_QUEUED_JOBS=64
+CRATERA_QUEUE_TIMEOUT_MS=10000
 CRATERA_USE_JAILER=1
 CRATERA_JAIL_UID=20001
 CRATERA_JAIL_GID=20001

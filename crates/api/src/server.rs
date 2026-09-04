@@ -208,6 +208,9 @@ pub async fn start_server() -> anyhow::Result<()> {
         rootfs = %cfg.rootfs.display(),
         jailer = cfg.use_jailer,
         snapshot = cfg.use_snapshot,
+        max_concurrent_jobs = cfg.max_concurrent_jobs,
+        max_queued_jobs = cfg.max_queued_jobs,
+        queue_timeout_ms = cfg.queue_timeout.as_millis() as u64,
         default_language = %cfg.languages.default_language,
         "executor config"
     );
@@ -329,10 +332,21 @@ pub async fn harness(
             Ok(Json(result))
         }
         Err(ExecError::Busy) => {
-            tracing::warn!(language = %language, "job_record");
+            tracing::warn!(language = %language, reason = "queue_timeout", "job_record");
             Err((
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error":"busy","unavailable":true})),
+                Json(
+                    serde_json::json!({"error":"queue timeout","code":"queue_timeout","unavailable":true}),
+                ),
+            ))
+        }
+        Err(ExecError::QueueFull) => {
+            tracing::warn!(language = %language, reason = "queue_full", "job_record");
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(
+                    serde_json::json!({"error":"queue full","code":"queue_full","unavailable":true}),
+                ),
             ))
         }
         Err(ExecError::Failed(msg)) => {

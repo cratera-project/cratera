@@ -177,6 +177,7 @@ Send a `POST /harness` request to execute code in an isolated microVM instance. 
 | `400` | Invalid request payload or missing required `code` parameter. |
 | `401` | Missing or invalid Bearer authentication token. |
 | `500` | Internal infrastructure or microVM initialization failure. |
+| `503` | The bounded queue is full (`queue_full`) or its wait deadline elapsed (`queue_timeout`). |
 
 ### Running Examples
 
@@ -278,6 +279,9 @@ Cratera reads settings from environment variables or a `.env` file:
 | `CRATERA_MEM_MIB` | `2048` | Guest RAM allocated per microVM in MiB. |
 | `CRATERA_RUN_MS` | `2000` | Execution time limit for test runs in milliseconds. |
 | `CRATERA_SUBMIT_MS` | `5000` | Execution time limit for submissions in milliseconds. |
+| `CRATERA_MAX_CONCURRENT_JOBS` | `1` | Maximum number of microVM jobs executing simultaneously. |
+| `CRATERA_MAX_QUEUED_JOBS` | `64` | Maximum submissions waiting for an execution slot. |
+| `CRATERA_QUEUE_TIMEOUT_MS` | `10000` | Maximum queue wait in milliseconds. |
 | `CRATERA_USE_JAILER` | `0` | Development default: `0` (disabled for local testing; production systemd service sets `1` for UID 20001 chroot). |
 
 For the complete list of variables and defaults, see [docs/configuration.md](docs/configuration.md).

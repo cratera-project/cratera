@@ -10,7 +10,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{Semaphore, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tracing::{info, warn};
 
 mod image_hash;
@@ -32,13 +32,17 @@ fn jail_cpu_max_value(vcpu: u8, override_val: Option<&str>) -> String {
     format!("{} {CPU_PERIOD_US}", u32::from(vcpu.max(1)) * CPU_PERIOD_US)
 }
 const SNAP_MEMORY_MAX: &str = "6442450944";
+const MAX_CONCURRENT_JOBS_LIMIT: usize = 1024;
+const MAX_QUEUED_JOBS_LIMIT: usize = 100_000;
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(3);
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ExecError {
-    #[error("busy")]
+    #[error("executor queue wait timed out")]
     Busy,
+    #[error("executor queue is full")]
+    QueueFull,
     #[error("{0}")]
     Failed(String),
 }
@@ -340,6 +344,9 @@ pub struct ExecutorConfig {
     pub vcpu: u8,
     pub mem_mib: u32,
     pub compile_timeout: Duration,
+    pub max_concurrent_jobs: usize,
+    pub max_queued_jobs: usize,
+    pub queue_timeout: Duration,
     pub jail_mem_max: String,
     pub jail_cpu_max: String,
     pub jail_pids_max: u32,
@@ -392,6 +399,20 @@ impl ExecutorConfig {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(12);
+        let max_concurrent_jobs = std::env::var("CRATERA_MAX_CONCURRENT_JOBS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|value| (1..=MAX_CONCURRENT_JOBS_LIMIT).contains(value))
+            .unwrap_or(1);
+        let max_queued_jobs = std::env::var("CRATERA_MAX_QUEUED_JOBS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|value| *value <= MAX_QUEUED_JOBS_LIMIT)
+            .unwrap_or(64);
+        let queue_timeout_ms = std::env::var("CRATERA_QUEUE_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10_000);
         let jail_mem_max =
             std::env::var("CRATERA_JAIL_MEM_MAX").unwrap_or_else(|_| JAIL_MEMORY_MAX.into());
         let jail_cpu_max =
@@ -427,6 +448,9 @@ impl ExecutorConfig {
             vcpu,
             mem_mib,
             compile_timeout: Duration::from_secs(compile_timeout_secs),
+            max_concurrent_jobs,
+            max_queued_jobs,
+            queue_timeout: Duration::from_millis(queue_timeout_ms),
             jail_mem_max,
             jail_cpu_max,
             jail_pids_max,
@@ -453,15 +477,68 @@ impl ExecutorConfig {
 
 pub struct FirecrackerExecutor {
     cfg: ExecutorConfig,
+    limiter: ExecutionLimiter,
+}
+
+#[derive(Clone)]
+struct ExecutionLimiter {
     slots: Arc<Semaphore>,
+    admissions: Arc<Semaphore>,
+    queue_timeout: Duration,
+}
+
+struct ExecutionPermit {
+    _slot: OwnedSemaphorePermit,
+    _admission: OwnedSemaphorePermit,
+}
+
+impl ExecutionLimiter {
+    fn new(max_concurrent: usize, max_queued: usize, queue_timeout: Duration) -> Self {
+        let max_concurrent = max_concurrent.clamp(1, MAX_CONCURRENT_JOBS_LIMIT);
+        let max_queued = max_queued.min(MAX_QUEUED_JOBS_LIMIT);
+        Self {
+            slots: Arc::new(Semaphore::new(max_concurrent)),
+            admissions: Arc::new(Semaphore::new(max_concurrent.saturating_add(max_queued))),
+            queue_timeout,
+        }
+    }
+
+    async fn acquire(&self) -> Result<ExecutionPermit, ExecError> {
+        let admission =
+            self.admissions
+                .clone()
+                .try_acquire_owned()
+                .map_err(|error| match error {
+                    tokio::sync::TryAcquireError::NoPermits => ExecError::QueueFull,
+                    tokio::sync::TryAcquireError::Closed => {
+                        ExecError::Failed("executor closed".into())
+                    }
+                })?;
+        let slot = match tokio::time::timeout(
+            self.queue_timeout,
+            self.slots.clone().acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => return Err(ExecError::Failed("executor closed".into())),
+            Err(_) => return Err(ExecError::Busy),
+        };
+        Ok(ExecutionPermit {
+            _slot: slot,
+            _admission: admission,
+        })
+    }
 }
 
 impl FirecrackerExecutor {
     pub fn new(cfg: ExecutorConfig) -> Self {
-        Self {
-            cfg,
-            slots: Arc::new(Semaphore::new(1)),
-        }
+        let limiter = ExecutionLimiter::new(
+            cfg.max_concurrent_jobs,
+            cfg.max_queued_jobs,
+            cfg.queue_timeout,
+        );
+        Self { cfg, limiter }
     }
 
     pub fn config(&self) -> &ExecutorConfig {
@@ -507,16 +584,7 @@ impl FirecrackerExecutor {
         timeout_ms: u64,
         lang: Option<ResolvedLanguage>,
     ) -> Result<JobOutcome, ExecError> {
-        let permit = match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            self.slots.clone().acquire_owned(),
-        )
-        .await
-        {
-            Ok(Ok(p)) => p,
-            Ok(Err(_)) => return Err(ExecError::Failed("executor closed".into())),
-            Err(_) => return Err(ExecError::Busy),
-        };
+        let permit = self.limiter.acquire().await?;
         let cfg = self.cfg.clone();
         let target_lang = lang.unwrap_or_else(|| {
             self.cfg
@@ -1341,6 +1409,55 @@ mod tests {
     use std::io::Cursor;
     use std::os::unix::net::UnixListener;
     use std::thread;
+
+    #[tokio::test]
+    async fn execution_limiter_runs_up_to_configured_capacity() {
+        let limiter = ExecutionLimiter::new(2, 0, Duration::from_secs(1));
+        let first = limiter.acquire().await.unwrap();
+        let second = limiter.acquire().await.unwrap();
+
+        assert!(matches!(limiter.acquire().await, Err(ExecError::QueueFull)));
+
+        drop(first);
+        drop(second);
+        assert!(limiter.acquire().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn execution_limiter_bounds_the_waiting_queue() {
+        let limiter = ExecutionLimiter::new(1, 1, Duration::from_secs(1));
+        let running = limiter.acquire().await.unwrap();
+        let queued_limiter = limiter.clone();
+        let queued = tokio::spawn(async move { queued_limiter.acquire().await });
+        tokio::task::yield_now().await;
+
+        assert!(matches!(limiter.acquire().await, Err(ExecError::QueueFull)));
+
+        drop(running);
+        assert!(queued.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn execution_limiter_times_out_queued_work() {
+        let limiter = ExecutionLimiter::new(1, 1, Duration::from_millis(1));
+        let _running = limiter.acquire().await.unwrap();
+
+        assert!(matches!(limiter.acquire().await, Err(ExecError::Busy)));
+        assert!(matches!(limiter.acquire().await, Err(ExecError::Busy)));
+    }
+
+    #[tokio::test]
+    async fn execution_limiter_reclaims_cancelled_queue_admission() {
+        let limiter = ExecutionLimiter::new(1, 1, Duration::from_millis(1));
+        let _running = limiter.acquire().await.unwrap();
+        let queued_limiter = limiter.clone();
+        let queued = tokio::spawn(async move { queued_limiter.acquire().await });
+        tokio::task::yield_now().await;
+        queued.abort();
+        let _ = queued.await;
+
+        assert!(matches!(limiter.acquire().await, Err(ExecError::Busy)));
+    }
 
     #[test]
     fn http_204_does_not_wait_for_peer_close() {
