@@ -193,7 +193,7 @@ pub async fn start_server() -> anyhow::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(MAX_TIME_MS);
 
-    let cfg = ExecutorConfig::from_env();
+    let cfg = ExecutorConfig::try_from_env().map_err(anyhow::Error::msg)?;
     if production && !cfg.use_jailer {
         anyhow::bail!("Jailer required in production (CRATERA_USE_JAILER=0 is set)");
     }

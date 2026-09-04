@@ -7,6 +7,7 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -34,6 +35,10 @@ fn jail_cpu_max_value(vcpu: u8, override_val: Option<&str>) -> String {
 const SNAP_MEMORY_MAX: &str = "6442450944";
 const MAX_CONCURRENT_JOBS_LIMIT: usize = 1024;
 const MAX_QUEUED_JOBS_LIMIT: usize = 100_000;
+const MAX_VCPU: u8 = 32;
+const MIN_MEM_MIB: u32 = 128;
+const MAX_MEM_MIB: u32 = 65_536;
+const MAX_JAIL_PIDS: u32 = 65_536;
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(3);
 
@@ -355,11 +360,31 @@ pub struct ExecutorConfig {
 
 impl ExecutorConfig {
     pub fn from_env() -> Self {
+        Self::try_from_env()
+            .unwrap_or_else(|error| panic!("invalid executor configuration: {error}"))
+    }
+
+    pub fn try_from_env() -> Result<Self, String> {
         fn env_path(cratera_key: &str, grade_key: &str, default: &str) -> PathBuf {
             let val = std::env::var(cratera_key)
                 .or_else(|_| std::env::var(grade_key))
                 .unwrap_or_else(|_| default.to_string());
             PathBuf::from(val)
+        }
+        fn env_parse<T>(key: &str, legacy_key: Option<&str>, default: T) -> Result<T, String>
+        where
+            T: FromStr,
+            T::Err: std::fmt::Display,
+        {
+            let value = std::env::var(key)
+                .ok()
+                .or_else(|| legacy_key.and_then(|legacy| std::env::var(legacy).ok()));
+            match value {
+                Some(raw) => raw
+                    .parse()
+                    .map_err(|error| format!("{key} must be a valid value: {error}")),
+                None => Ok(default),
+            }
         }
         fn env_flag_dual(cratera_key: &str, grade_key: &str, default: bool) -> bool {
             std::env::var(cratera_key)
@@ -385,44 +410,31 @@ impl ExecutorConfig {
                     .unwrap_or_else(|| Path::new("."))
                     .join("snapshot")
             });
-        let vcpu = std::env::var("CRATERA_VCPU")
-            .or_else(|_| std::env::var("GRADE_VCPU"))
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(GUEST_VCPU);
-        let mem_mib = std::env::var("CRATERA_MEM_MIB")
-            .or_else(|_| std::env::var("GRADE_MEM_MIB"))
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(GUEST_MEM_MIB);
-        let compile_timeout_secs = std::env::var("CRATERA_COMPILE_TIMEOUT_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(12);
-        let max_concurrent_jobs = std::env::var("CRATERA_MAX_CONCURRENT_JOBS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|value| (1..=MAX_CONCURRENT_JOBS_LIMIT).contains(value))
-            .unwrap_or(1);
-        let max_queued_jobs = std::env::var("CRATERA_MAX_QUEUED_JOBS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|value| *value <= MAX_QUEUED_JOBS_LIMIT)
-            .unwrap_or(64);
-        let queue_timeout_ms = std::env::var("CRATERA_QUEUE_TIMEOUT_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(10_000);
+        let vcpu = env_parse("CRATERA_VCPU", Some("GRADE_VCPU"), GUEST_VCPU)?;
+        let mem_mib = env_parse("CRATERA_MEM_MIB", Some("GRADE_MEM_MIB"), GUEST_MEM_MIB)?;
+        let compile_timeout_secs = env_parse("CRATERA_COMPILE_TIMEOUT_SECS", None, 12_u64)?;
+        let max_concurrent_jobs = env_parse("CRATERA_MAX_CONCURRENT_JOBS", None, 1_usize)?;
+        let max_queued_jobs = env_parse("CRATERA_MAX_QUEUED_JOBS", None, 64_usize)?;
+        let queue_timeout_ms = env_parse("CRATERA_QUEUE_TIMEOUT_MS", None, 10_000_u64)?;
         let jail_mem_max =
             std::env::var("CRATERA_JAIL_MEM_MAX").unwrap_or_else(|_| JAIL_MEMORY_MAX.into());
         let jail_cpu_max =
             jail_cpu_max_value(vcpu, std::env::var("CRATERA_JAIL_CPU_MAX").ok().as_deref());
-        let jail_pids_max = std::env::var("CRATERA_JAIL_PIDS_MAX")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(64);
+        let jail_pids_max = env_parse("CRATERA_JAIL_PIDS_MAX", None, 64_u32)?;
 
-        Self {
+        validate_resource_config(&ResourceConfig {
+            vcpu,
+            mem_mib,
+            jail_mem_max: &jail_mem_max,
+            jail_cpu_max: &jail_cpu_max,
+            jail_pids_max,
+            max_concurrent_jobs,
+            max_queued_jobs,
+            queue_timeout_ms,
+            compile_timeout_secs,
+        })?;
+
+        Ok(Self {
             firecracker: env_path(
                 "CRATERA_FIRECRACKER",
                 "GRADE_FIRECRACKER",
@@ -455,7 +467,7 @@ impl ExecutorConfig {
             jail_cpu_max,
             jail_pids_max,
             languages: LanguageRegistry::from_env_or_file(),
-        }
+        })
     }
 
     pub fn verify_guest_images(&self, require_checksums: bool) -> Result<(), String> {
@@ -473,6 +485,90 @@ impl ExecutorConfig {
         }
         Ok(())
     }
+}
+
+struct ResourceConfig<'a> {
+    vcpu: u8,
+    mem_mib: u32,
+    jail_mem_max: &'a str,
+    jail_cpu_max: &'a str,
+    jail_pids_max: u32,
+    max_concurrent_jobs: usize,
+    max_queued_jobs: usize,
+    queue_timeout_ms: u64,
+    compile_timeout_secs: u64,
+}
+
+fn validate_resource_config(config: &ResourceConfig<'_>) -> Result<(), String> {
+    if !(1..=MAX_VCPU).contains(&config.vcpu) {
+        return Err(format!("CRATERA_VCPU must be between 1 and {MAX_VCPU}"));
+    }
+    if !(MIN_MEM_MIB..=MAX_MEM_MIB).contains(&config.mem_mib) {
+        return Err(format!(
+            "CRATERA_MEM_MIB must be between {MIN_MEM_MIB} and {MAX_MEM_MIB}"
+        ));
+    }
+    let jail_mem_bytes = config
+        .jail_mem_max
+        .parse::<u64>()
+        .map_err(|_| "CRATERA_JAIL_MEM_MAX must be a byte count".to_string())?;
+    let guest_mem_bytes = u64::from(config.mem_mib)
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| "CRATERA_MEM_MIB is too large".to_string())?;
+    if jail_mem_bytes < guest_mem_bytes {
+        return Err("CRATERA_JAIL_MEM_MAX must be at least CRATERA_MEM_MIB in bytes".to_string());
+    }
+    validate_cpu_max(config.jail_cpu_max)?;
+    if !(1..=MAX_JAIL_PIDS).contains(&config.jail_pids_max) {
+        return Err(format!(
+            "CRATERA_JAIL_PIDS_MAX must be between 1 and {MAX_JAIL_PIDS}"
+        ));
+    }
+    if !(1..=MAX_CONCURRENT_JOBS_LIMIT).contains(&config.max_concurrent_jobs) {
+        return Err(format!(
+            "CRATERA_MAX_CONCURRENT_JOBS must be between 1 and {MAX_CONCURRENT_JOBS_LIMIT}"
+        ));
+    }
+    if config.max_queued_jobs > MAX_QUEUED_JOBS_LIMIT {
+        return Err(format!(
+            "CRATERA_MAX_QUEUED_JOBS must not exceed {MAX_QUEUED_JOBS_LIMIT}"
+        ));
+    }
+    if config.queue_timeout_ms == 0 {
+        return Err("CRATERA_QUEUE_TIMEOUT_MS must be greater than 0".to_string());
+    }
+    if config.compile_timeout_secs == 0 {
+        return Err("CRATERA_COMPILE_TIMEOUT_SECS must be greater than 0".to_string());
+    }
+    Ok(())
+}
+
+fn validate_cpu_max(value: &str) -> Result<(), String> {
+    let mut fields = value.split_whitespace();
+    let quota = fields
+        .next()
+        .ok_or_else(|| "CRATERA_JAIL_CPU_MAX must contain quota and period".to_string())?;
+    let period = fields
+        .next()
+        .ok_or_else(|| "CRATERA_JAIL_CPU_MAX must contain quota and period".to_string())?;
+    if fields.next().is_some() {
+        return Err("CRATERA_JAIL_CPU_MAX must contain exactly quota and period".to_string());
+    }
+    if quota != "max" {
+        let parsed = quota
+            .parse::<u64>()
+            .map_err(|_| "CRATERA_JAIL_CPU_MAX quota must be positive or 'max'".to_string())?;
+        if parsed == 0 {
+            return Err("CRATERA_JAIL_CPU_MAX quota must be positive".to_string());
+        }
+    }
+    let period = period
+        .parse::<u64>()
+        .map_err(|_| "CRATERA_JAIL_CPU_MAX period must be an integer".to_string())?;
+    if !(1_000..=1_000_000).contains(&period) {
+        return Err("CRATERA_JAIL_CPU_MAX period must be between 1000 and 1000000".to_string());
+    }
+    Ok(())
 }
 
 pub struct FirecrackerExecutor {
@@ -1409,6 +1505,70 @@ mod tests {
     use std::io::Cursor;
     use std::os::unix::net::UnixListener;
     use std::thread;
+
+    fn valid_resource_config<'a>(
+        jail_mem_max: &'a str,
+        jail_cpu_max: &'a str,
+    ) -> ResourceConfig<'a> {
+        ResourceConfig {
+            vcpu: 2,
+            mem_mib: 2048,
+            jail_mem_max,
+            jail_cpu_max,
+            jail_pids_max: 64,
+            max_concurrent_jobs: 1,
+            max_queued_jobs: 64,
+            queue_timeout_ms: 10_000,
+            compile_timeout_secs: 12,
+        }
+    }
+
+    #[test]
+    fn resource_config_accepts_defaults() {
+        assert!(
+            validate_resource_config(&valid_resource_config(JAIL_MEMORY_MAX, "200000 100000"))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn resource_config_rejects_invalid_vm_sizes() {
+        let mut config = valid_resource_config(JAIL_MEMORY_MAX, "200000 100000");
+        config.vcpu = 0;
+        assert!(
+            validate_resource_config(&config)
+                .unwrap_err()
+                .contains("CRATERA_VCPU")
+        );
+
+        config.vcpu = 2;
+        config.mem_mib = 64;
+        assert!(
+            validate_resource_config(&config)
+                .unwrap_err()
+                .contains("CRATERA_MEM_MIB")
+        );
+    }
+
+    #[test]
+    fn resource_config_rejects_cgroup_memory_below_guest_memory() {
+        let config = valid_resource_config("1073741824", "200000 100000");
+        assert!(
+            validate_resource_config(&config)
+                .unwrap_err()
+                .contains("CRATERA_JAIL_MEM_MAX")
+        );
+    }
+
+    #[test]
+    fn cpu_max_validation_accepts_linux_format_and_rejects_bad_values() {
+        assert!(validate_cpu_max("200000 100000").is_ok());
+        assert!(validate_cpu_max("max 100000").is_ok());
+        assert!(validate_cpu_max("0 100000").is_err());
+        assert!(validate_cpu_max("200000").is_err());
+        assert!(validate_cpu_max("200000 999").is_err());
+        assert!(validate_cpu_max("200000 100000 extra").is_err());
+    }
 
     #[tokio::test]
     async fn execution_limiter_runs_up_to_configured_capacity() {

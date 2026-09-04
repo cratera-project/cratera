@@ -20,7 +20,7 @@ pub async fn run_test(args: &[String]) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let cfg = ExecutorConfig::from_env();
+    let cfg = ExecutorConfig::try_from_env().map_err(anyhow::Error::msg)?;
     if !cfg.firecracker.exists() {
         eprintln!(
             "{RED}Error:{RESET} Firecracker binary missing at: {}",

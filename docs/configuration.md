@@ -13,15 +13,15 @@ Cratera is configured through environment variables or a `.env` file located in 
 | `CRATERA_RUN_MS` | `2000` | Execution time limit for standard test runs (`"mode": "run"`), in milliseconds. |
 | `CRATERA_SUBMIT_MS` | `5000` | Execution time limit for formal submissions (`"mode": "submit"`), in milliseconds. |
 | `CRATERA_MAX_TIME_MS` | `10000` | Hard upper ceiling for execution timeouts (ms). |
-| `CRATERA_COMPILE_TIMEOUT_SECS` | `12` | In-guest compilation timeout limit, in seconds. |
+| `CRATERA_COMPILE_TIMEOUT_SECS` | `12` | Compilation wall-time allowance, in seconds; must be greater than zero. |
 | `CRATERA_MAX_CONCURRENT_JOBS` | `1` | Maximum number of microVM jobs that may execute simultaneously (1–1024). Size this against host CPU and memory. |
 | `CRATERA_MAX_QUEUED_JOBS` | `64` | Maximum submissions waiting for an execution slot (0–100000). Additional submissions fail immediately with `queue_full`. |
 | `CRATERA_QUEUE_TIMEOUT_MS` | `10000` | Maximum queue wait before a submission fails with `queue_timeout`. |
-| `CRATERA_VCPU` | `2` | Number of virtual CPU cores allocated per microVM. |
-| `CRATERA_MEM_MIB` | `2048` | Guest RAM memory allocated per microVM, in MiB. |
-| `CRATERA_JAIL_MEM_MAX` | `3221225472` | Host cgroup `memory.max` limit per Firecracker process (3 GiB in bytes). |
+| `CRATERA_VCPU` | `2` | Virtual CPU cores per microVM (1–32). |
+| `CRATERA_MEM_MIB` | `2048` | Guest RAM per microVM in MiB (128–65536). |
+| `CRATERA_JAIL_MEM_MAX` | `3221225472` | Host cgroup `memory.max` per Firecracker process, in bytes. Must be at least the configured guest RAM. |
 | `CRATERA_JAIL_CPU_MAX` | `{CRATERA_VCPU} × 100000 100000` | Host cgroup `cpu.max` (`quota period`). Default is one period of quota per vCPU (2 vCPUs → `200000 100000`). |
-| `CRATERA_JAIL_PIDS_MAX` | `64` | Host cgroup `pids.max` limit per microVM. |
+| `CRATERA_JAIL_PIDS_MAX` | `64` | Host cgroup `pids.max` limit per microVM (1–65536). |
 | `CRATERA_FIRECRACKER` | `./images/firecracker` | Path to the Firecracker binary. |
 | `CRATERA_JAILER` | `./images/jailer` | Path to the Jailer binary. |
 | `CRATERA_KERNEL` | `./images/vmlinux.bin` | Path to the uncompressed guest Linux kernel binary. |
@@ -32,6 +32,8 @@ Cratera is configured through environment variables or a `.env` file located in 
 | `CRATERA_JAIL_GID` | `20001` | Dedicated unprivileged GID for the jailed Firecracker process. |
 | `CRATERA_USE_SNAPSHOT` | `0` | Set `1` to enable fast snapshot restore (~5ms boot). |
 | `CRATERA_SNAPSHOT_DIR` | `./images/snapshot` | Directory holding the golden microVM memory and guest CPU state. |
+
+Invalid resource values fail server startup instead of silently falling back. When raising concurrency, reserve at least `CRATERA_MAX_CONCURRENT_JOBS × CRATERA_JAIL_MEM_MAX` bytes of host memory, plus capacity for the coordinator and operating system.
 
 ---
 
