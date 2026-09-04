@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fs;
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
@@ -23,6 +24,8 @@ const BOOT_WAIT: Duration = Duration::from_secs(20);
 const POWEROFF_GRACE: Duration = Duration::from_secs(3);
 const SNAP_WAIT: Duration = Duration::from_secs(60);
 const SNAP_CREATE_WAIT: Duration = Duration::from_secs(180);
+const SNAP_LOCK_WAIT: Duration = Duration::from_secs(60);
+const SNAPSHOT_FINGERPRINT_VERSION: &str = "cratera-snapshot-v1";
 const JAIL_MEMORY_MAX: &str = "3221225472";
 const CPU_PERIOD_US: u32 = 100_000;
 
@@ -726,8 +729,18 @@ impl FirecrackerExecutor {
             warn!("CRATERA_USE_SNAPSHOT ignored without jailer (vsock paths are not portable)");
             return Ok(());
         }
+        // Serialize both validation and publication. Snapshot files are
+        // shared across service processes and are replaced as a unit.
+        let _snapshot_lock = acquire_snapshot_lock(&self.cfg)?;
         let snap = snap_paths(&self.cfg);
-        if snap.ready() {
+        let fingerprint = match snapshot_fingerprint(&self.cfg) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                let _ = fs::remove_file(&snap.fingerprint);
+                return Err(error);
+            }
+        };
+        if snap.matches_fingerprint(&fingerprint) {
             info!(
                 snap = %snap.state.display(),
                 mem = %snap.mem.display(),
@@ -735,12 +748,18 @@ impl FirecrackerExecutor {
             );
             return Ok(());
         }
+        if snap.ready() {
+            info!(
+                snap = %snap.state.display(),
+                "existing Firecracker snapshot fingerprint is stale; rebuilding"
+            );
+        }
         info!("creating Firecracker snapshot (agent listen)");
-        create_golden_snapshot(&self.cfg)?;
+        create_golden_snapshot(&self.cfg, &fingerprint)?;
         chmod_snapshot_group(&self.cfg)?;
-        if !snap.ready() {
+        if !snap.matches_fingerprint(&fingerprint) {
             return Err(ExecError::Failed(
-                "snapshot create did not write files".into(),
+                "snapshot create did not publish matching files".into(),
             ));
         }
         info!(
@@ -821,11 +840,28 @@ struct JobLayout {
 struct SnapPaths {
     state: PathBuf,
     mem: PathBuf,
+    fingerprint: PathBuf,
 }
 
 impl SnapPaths {
     fn ready(&self) -> bool {
-        self.state.is_file() && self.mem.is_file()
+        self.state
+            .metadata()
+            .map(|metadata| metadata.is_file() && metadata.len() > 0)
+            .unwrap_or(false)
+            && self
+                .mem
+                .metadata()
+                .map(|metadata| metadata.is_file() && metadata.len() > 0)
+                .unwrap_or(false)
+            && self.fingerprint.is_file()
+    }
+
+    fn matches_fingerprint(&self, fingerprint: &str) -> bool {
+        self.ready()
+            && fs::read_to_string(&self.fingerprint)
+                .map(|stored| stored == fingerprint)
+                .unwrap_or(false)
     }
 }
 
@@ -833,7 +869,76 @@ fn snap_paths(cfg: &ExecutorConfig) -> SnapPaths {
     SnapPaths {
         state: cfg.snapshot_dir.join("vm.snap"),
         mem: cfg.snapshot_dir.join("vm.mem"),
+        fingerprint: cfg.snapshot_dir.join("vm.fingerprint"),
     }
+}
+
+struct SnapshotLock {
+    file: fs::File,
+}
+
+impl Drop for SnapshotLock {
+    fn drop(&mut self) {
+        // The descriptor is closed immediately afterwards as well; explicitly
+        // unlocking keeps the ownership boundary clear and portable across
+        // fork/exec details.
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+fn acquire_snapshot_lock(cfg: &ExecutorConfig) -> Result<SnapshotLock, ExecError> {
+    fs::create_dir_all(&cfg.snapshot_dir).map_err(io_err)?;
+    let path = cfg.snapshot_dir.join(".snapshot.lock");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(io_err)?;
+    let deadline = Instant::now() + SNAP_LOCK_WAIT;
+    loop {
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(SnapshotLock { file });
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EWOULDBLOCK)
+            && error.raw_os_error() != Some(libc::EAGAIN)
+        {
+            return Err(io_err(error));
+        }
+        if Instant::now() >= deadline {
+            return Err(ExecError::Failed(format!(
+                "timed out waiting for snapshot lock {}",
+                path.display()
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn snapshot_fingerprint(cfg: &ExecutorConfig) -> Result<String, ExecError> {
+    let firecracker = image_hash::sha256_file(&cfg.firecracker)
+        .map_err(|error| ExecError::Failed(format!("snapshot Firecracker fingerprint: {error}")))?;
+    let kernel = image_hash::sha256_file(&cfg.kernel)
+        .map_err(|error| ExecError::Failed(format!("snapshot kernel fingerprint: {error}")))?;
+    let rootfs = image_hash::sha256_file(&cfg.rootfs)
+        .map_err(|error| ExecError::Failed(format!("snapshot rootfs fingerprint: {error}")))?;
+    Ok(format!(
+        "{SNAPSHOT_FINGERPRINT_VERSION}\nfirecracker={}\nkernel={}\nrootfs={}\nvcpu={}\nmem_mib={}\n",
+        format_digest(firecracker),
+        format_digest(kernel),
+        format_digest(rootfs),
+        cfg.vcpu,
+        cfg.mem_mib,
+    ))
+}
+
+fn format_digest(digest: [u8; 32]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn run_sync(
@@ -1142,8 +1247,16 @@ fn load_snapshot(
     Ok(())
 }
 
-fn create_golden_snapshot(cfg: &ExecutorConfig) -> Result<(), ExecError> {
+fn create_golden_snapshot(cfg: &ExecutorConfig, fingerprint: &str) -> Result<(), ExecError> {
     fs::create_dir_all(&cfg.snapshot_dir).map_err(io_err)?;
+    let snap = snap_paths(cfg);
+    // Invalidate the publication marker before replacing either snapshot file.
+    // A crash during creation must force the next start to rebuild.
+    if let Err(error) = fs::remove_file(&snap.fingerprint)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(io_err(error));
+    }
     let t0 = Instant::now();
     let layout = prepare_job(cfg)?;
     let fc_log = layout.jail_root.join("config/fc.log");
@@ -1199,9 +1312,10 @@ fn create_golden_snapshot(cfg: &ExecutorConfig) -> Result<(), ExecError> {
         info!("snapshot files written in jail");
         let src_state = layout.jail_root.join("snapshot/vm.snap");
         let src_mem = layout.jail_root.join("snapshot/vm.mem");
-        fs::copy(&src_state, snap_paths(cfg).state).map_err(io_err)?;
-        fs::copy(&src_mem, snap_paths(cfg).mem).map_err(io_err)?;
+        publish_snapshot_file(&src_state, &snap.state)?;
+        publish_snapshot_file(&src_mem, &snap.mem)?;
         chmod_snapshot_group(cfg)?;
+        publish_snapshot_fingerprint(&snap.fingerprint, fingerprint)?;
         Ok(())
     })();
     reap_vm(&layout, &mut child, None);
@@ -1230,11 +1344,47 @@ fn create_golden_snapshot(cfg: &ExecutorConfig) -> Result<(), ExecError> {
             Ok(())
         }
         Err(e) => {
-            let _ = fs::remove_file(snap_paths(cfg).state);
-            let _ = fs::remove_file(snap_paths(cfg).mem);
+            // The publication marker was removed before rebuilding, so old
+            // files cannot be restored accidentally. Keep them available for
+            // diagnosis and for a future successful rebuild.
+            let _ = fs::remove_file(snap_paths(cfg).fingerprint);
             Err(e)
         }
     }
+}
+
+fn publish_snapshot_file(source: &Path, destination: &Path) -> Result<(), ExecError> {
+    let temporary = snapshot_temp_path(destination);
+    let _ = fs::remove_file(&temporary);
+    let result = (|| {
+        fs::copy(source, &temporary).map_err(io_err)?;
+        fs::rename(&temporary, destination).map_err(io_err)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.map(|_| ())
+}
+
+fn publish_snapshot_fingerprint(destination: &Path, fingerprint: &str) -> Result<(), ExecError> {
+    let temporary = snapshot_temp_path(destination);
+    let _ = fs::remove_file(&temporary);
+    let result = (|| {
+        fs::write(&temporary, fingerprint).map_err(io_err)?;
+        fs::rename(&temporary, destination).map_err(io_err)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.map(|_| ())
+}
+
+fn snapshot_temp_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("snapshot");
+    path.with_file_name(format!(".{name}.tmp-{}", std::process::id()))
 }
 
 #[derive(Clone, Copy)]
@@ -1890,6 +2040,37 @@ mod tests {
 
         assert!(!fs::symlink_metadata(&destination).unwrap().is_symlink());
         assert_eq!(fs::read(&destination).unwrap(), b"rootfs");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn snapshot_requires_matching_complete_files_and_fingerprint() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "cratera-snapshot-ready-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let snap = SnapPaths {
+            state: dir.join("vm.snap"),
+            mem: dir.join("vm.mem"),
+            fingerprint: dir.join("vm.fingerprint"),
+        };
+
+        fs::write(&snap.state, b"state").unwrap();
+        fs::write(&snap.mem, b"memory").unwrap();
+        assert!(!snap.ready());
+
+        fs::write(&snap.fingerprint, b"fingerprint\n").unwrap();
+        assert!(snap.ready());
+        assert!(snap.matches_fingerprint("fingerprint\n"));
+        assert!(!snap.matches_fingerprint("stale\n"));
+
+        fs::write(&snap.mem, []).unwrap();
+        assert!(!snap.ready());
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -112,23 +112,35 @@ Cratera is organized as a Cargo workspace:
 
 - Linux on x86_64 with `/dev/kvm` hardware virtualization.
 - Docker or rootless Podman to build the guest root filesystem.
-- Rust toolchain 1.80+ if building from source.
+- Rust toolchain 1.97+ if building from source.
 
 ### Installation
 
 **Option A: Automated setup script (Recommended)**
 ```bash
-# Clones, downloads kernel, builds guest rootfs, and compiles cratera
+# Clones, downloads the kernel, builds a minimal Rust-only guest rootfs, and compiles cratera
 git clone https://github.com/cratera-project/cratera.git
 cd cratera
-./scripts/install.sh
+./scripts/install.sh --yes
 ```
+The installer keeps the default image small and quick to build. To install every
+configured language explicitly, use `./scripts/install.sh --yes --languages=all`.
+Use `--languages=<preset>` or `--languages=<language,language>` for another selection.
+
+### Start the coordinator
+
+From the repository root, start the verified release binary:
+```bash
+./target/release/cratera serve
+```
+The installer leaves systemd disabled by default. To opt into the production
+service after installation, run `./target/release/cratera service enable`.
 
 **Option B: Install binary via Cargo**
 ```bash
 cargo install cratera
 ```
-*Note: The binary requires guest images (kernel and rootfs); run `./scripts/install.sh` or `cratera doctor` to verify environment assets.*
+*Note: The binary requires guest images (kernel and rootfs); run `./scripts/install.sh --yes` or `cratera doctor` to verify environment assets.*
 
 ---
 
@@ -262,7 +274,7 @@ Each entry in [`languages.toml`](languages.toml) defines how a compiler is insta
 To change which languages are available in the root filesystem:
 
 1. Update [`languages.toml`](languages.toml) or run `cratera lang` to toggle runtimes.
-2. Rebuild the root filesystem with `./scripts/build-rootfs.sh` (or `cratera build`).
+2. Rebuild the root filesystem with `./scripts/install.sh --yes --languages=all` (or `./scripts/build-rootfs.sh`).
 
 For recipe options and examples, read [docs/languages.md](docs/languages.md).
 
