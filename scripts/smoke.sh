@@ -37,11 +37,14 @@ if [[ -f "${ROOT}/images/rootfs.squashfs" ]]; then
 else
   export CRATERA_ROOTFS="${ROOT}/images/rootfs.ext4"
 fi
-export CRATERA_WORK_DIR="${CRATERA_WORK_DIR:-/tmp/cratera-smoke}"
 export CRATERA_USE_JAILER="${CRATERA_USE_JAILER:-0}"
 export CRATERA_INTERNAL_KEY="dev-key-smoke-test-ok"
-export CRATERA_BIND="127.0.0.1:3100"
-mkdir -p "$CRATERA_WORK_DIR"
+export CRATERA_BIND="${CRATERA_BIND:-$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(f"127.0.0.1:{s.getsockname()[1]}"); s.close()')}"
+mkdir -p "${ROOT}/target"
+SMOKE_WORK="$(mktemp -d -p "${ROOT}/target" cratera-smoke.XXXXXX)"
+export CRATERA_WORK_DIR="$SMOKE_WORK"
+CASES_FILE="${SMOKE_WORK}/cases.tsv"
+URL="http://${CRATERA_BIND}"
 
 CLI_ARGS="$*"
 FILTER="${CLI_ARGS:-${LANGUAGES:-all}}"
@@ -77,20 +80,42 @@ echo "==> Building host binary (cratera)..."
 cargo build --release -p cratera
 
 echo "==> Starting local Cratera coordinator..."
-pkill -9 cratera 2>/dev/null || true
-sleep 0.2
-mkdir -p "${ROOT}/target/work"
-export CRATERA_WORK_DIR="${ROOT}/target/work"
 ./target/release/cratera serve &
 pid=$!
-trap 'kill -9 $pid 2>/dev/null || true; rm -rf "${ROOT}/target/work" 2>/dev/null || true' EXIT
+cleanup_smoke() {
+  local status=$?
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    for _ in $(seq 1 20); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.05
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+  fi
+  wait "$pid" 2>/dev/null || true
+  rm -rf "$SMOKE_WORK"
+  return "$status"
+}
+trap cleanup_smoke EXIT
 
+ready=0
 for _ in $(seq 1 50); do
-  if curl -sf http://127.0.0.1:3100/health >/dev/null; then
+  if curl -sf "${URL}/health" >/dev/null; then
+    ready=1
     break
+  fi
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "ERROR: coordinator exited before becoming ready"
+    exit 1
   fi
   sleep 0.1
 done
+if [[ "$ready" -ne 1 ]]; then
+  echo "ERROR: coordinator did not become ready at ${URL}"
+  exit 1
+fi
 
 pass_count=0
 fail_count=0
@@ -108,7 +133,7 @@ run_test() {
   tested_count=$((tested_count + 1))
   echo -n "  -> Testing $name ($lang)... "
   local res
-  res=$(curl -sf -X POST http://127.0.0.1:3100/harness \
+  res=$(curl -sf -X POST "${URL}/harness" \
     -H "Authorization: Bearer ${CRATERA_INTERNAL_KEY}" \
     -H "Content-Type: application/json" \
     -d "$payload" || echo '{"passed":false,"error":"curl_error"}')
@@ -126,13 +151,10 @@ run_test() {
   sleep 0.2
 }
 
-while IFS=$'\t' read -r l_key l_name l_payload; do
-  [[ -n "$l_key" ]] || continue
-  run_test "$l_key" "$l_name" "$l_payload"
-done < <(FILTER="$FILTER" python3 - << 'PYEOF'
+LANG_FILE="$LANG_FILE" FILTER="$FILTER" python3 - << 'PYEOF' > "$CASES_FILE"
 import tomllib, json, os
 
-with open("languages.toml", "rb") as f:
+with open(os.environ["LANG_FILE"], "rb") as f:
     data = tomllib.load(f)
 
 filter_val = os.environ.get("FILTER", "all").lower().strip()
@@ -142,41 +164,44 @@ for k, spec in langs.items():
     if not isinstance(spec, dict):
         continue
     is_enabled = spec.get("enabled", True)
-    # If a filter is explicitly requested, allow it through
     if filter_val not in ["all", ""]:
-        if filter_val == "minimal":
-            if k != "rust":
-                continue
-        elif filter_val == "systems":
-            if k not in ["rust", "c", "cpp", "go", "zig", "nim", "d", "fortran"]:
-                continue
-        elif filter_val == "web":
-            if k not in ["rust", "python", "node", "typescript", "ruby", "php", "lua"]:
-                continue
+        if filter_val == "minimal" and k != "rust":
+            continue
+        if filter_val == "systems" and k not in ["rust", "c", "cpp", "go", "zig", "nim", "d", "fortran"]:
+            continue
+        if filter_val == "web" and k not in ["rust", "python", "node", "typescript", "ruby", "php", "lua"]:
+            continue
         targets = [t.strip() for t in filter_val.replace(" ", ",").split(",") if t.strip()]
-        if k not in targets:
+        if filter_val not in ["minimal", "systems", "web"] and k not in targets:
             continue
     elif not is_enabled:
         continue
 
-    name = spec.get("name", k)
     code = spec.get("test_code", "")
     if not code:
         continue
-    harness = spec.get("test_harness", "")
     payload = {"language": k, "code": code, "mode": "submit"}
-    if harness:
-        payload["harness"] = harness
-    print(f"{k}\t{name}\t{json.dumps(payload)}")
+    if spec.get("test_harness", ""):
+        payload["harness"] = spec["test_harness"]
+    print(f"{k}\t{spec.get('name', k)}\t{json.dumps(payload)}")
 PYEOF
-)
+
+while IFS=$'\t' read -r l_key l_name l_payload; do
+  [[ -n "$l_key" ]] || continue
+  run_test "$l_key" "$l_name" "$l_payload"
+done < "$CASES_FILE"
 
 echo ""
 echo "======================================================="
 echo " Summary: $pass_count/$tested_count passed, $fail_count failed"
 echo "======================================================="
 
-if [ "$fail_count" -gt 0 ]; then
+if [[ "$tested_count" -eq 0 ]]; then
+  echo "ERROR: no smoke tests were generated for filter '$FILTER'"
+  exit 1
+fi
+
+if [[ "$fail_count" -gt 0 ]]; then
   exit 1
 fi
 

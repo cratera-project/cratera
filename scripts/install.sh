@@ -33,7 +33,7 @@ fi
 
 # Fast path: start server
 if [[ "$MODE" == "--start" || "$MODE" == "start" || "$MODE" == "run" ]]; then
-  exec cargo run --release --bin cratera
+  exec cargo run --release --bin cratera -- serve
 fi
 
 WANT_SERVICE=0
@@ -259,15 +259,8 @@ else
 fi
 
 if [[ "${DO_SYSTEMD:-0}" -eq 1 ]]; then
-  if [[ "$(id -u)" -eq 0 ]]; then
-    cp deploy/cratera.service /etc/systemd/system/
-    systemctl daemon-reload
-    systemctl enable --now cratera.service
-  else
-    sudo cp deploy/cratera.service /etc/systemd/system/
-    sudo systemctl daemon-reload
-    sudo systemctl enable --now cratera.service
-  fi
+  cargo build --release -p cratera
+  ./target/release/cratera service enable
   echo -e "${GREEN}  ✓ Cratera systemd service installed, enabled on boot & active${RESET}"
 else
   echo -e "${DIM}  Skipping systemd installation. You can start Cratera manually or enable later.${RESET}"

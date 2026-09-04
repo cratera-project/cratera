@@ -4,12 +4,12 @@ use serde_json::json;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tracing::{info, warn};
@@ -48,8 +48,88 @@ pub enum ExecError {
     Busy,
     #[error("executor queue is full")]
     QueueFull,
+    #[error("execution deadline exceeded")]
+    ExecutionDeadline,
+    #[error("microVM boot timed out")]
+    BootTimeout,
     #[error("{0}")]
     Failed(String),
+}
+
+#[derive(Clone)]
+struct Deadline {
+    at: Instant,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Deadline {
+    fn from_now(budget: Duration) -> Result<Self, ExecError> {
+        let at = Instant::now()
+            .checked_add(budget)
+            .ok_or(ExecError::ExecutionDeadline)?;
+        Ok(Self {
+            at,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    fn remaining(&self) -> Result<Duration, ExecError> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(ExecError::ExecutionDeadline);
+        }
+        self.at
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(ExecError::ExecutionDeadline)
+    }
+
+    fn cap(&self, phase_limit: Duration) -> Result<Duration, ExecError> {
+        Ok(self.remaining()?.min(phase_limit))
+    }
+
+    fn with_reserve(&self, reserve: Duration) -> Result<Self, ExecError> {
+        let at = self
+            .at
+            .checked_sub(reserve)
+            .ok_or(ExecError::ExecutionDeadline)?;
+        if at <= Instant::now() {
+            return Err(ExecError::ExecutionDeadline);
+        }
+        Ok(Self {
+            at,
+            cancelled: self.cancelled.clone(),
+        })
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+struct CancellationGuard {
+    deadline: Deadline,
+    armed: bool,
+}
+
+impl CancellationGuard {
+    fn new(deadline: Deadline) -> Self {
+        Self {
+            deadline,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancellationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.deadline.cancel();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -599,7 +679,7 @@ impl ExecutionLimiter {
         }
     }
 
-    async fn acquire(&self) -> Result<ExecutionPermit, ExecError> {
+    async fn acquire(&self, deadline: &Deadline) -> Result<ExecutionPermit, ExecError> {
         let admission =
             self.admissions
                 .clone()
@@ -610,11 +690,8 @@ impl ExecutionLimiter {
                         ExecError::Failed("executor closed".into())
                     }
                 })?;
-        let slot = match tokio::time::timeout(
-            self.queue_timeout,
-            self.slots.clone().acquire_owned(),
-        )
-        .await
+        let queue_wait = deadline.cap(self.queue_timeout)?;
+        let slot = match tokio::time::timeout(queue_wait, self.slots.clone().acquire_owned()).await
         {
             Ok(Ok(permit)) => permit,
             Ok(Err(_)) => return Err(ExecError::Failed("executor closed".into())),
@@ -680,7 +757,11 @@ impl FirecrackerExecutor {
         timeout_ms: u64,
         lang: Option<ResolvedLanguage>,
     ) -> Result<JobOutcome, ExecError> {
-        let permit = self.limiter.acquire().await?;
+        let request_start = Instant::now();
+        let budget = execution_budget(&self.cfg, timeout_ms)?;
+        let deadline = Deadline::from_now(budget)?;
+        let mut cancellation = CancellationGuard::new(deadline.clone());
+        let permit = self.limiter.acquire(&deadline).await?;
         let cfg = self.cfg.clone();
         let target_lang = lang.unwrap_or_else(|| {
             self.cfg
@@ -689,16 +770,43 @@ impl FirecrackerExecutor {
                 .expect("default language must resolve")
         });
         let (tx, rx) = oneshot::channel();
+        let worker_deadline = deadline.clone();
         tokio::task::spawn_blocking(move || {
-            let result = run_sync(&cfg, &source, timeout_ms, target_lang, tx);
+            let result = run_sync(
+                &cfg,
+                &source,
+                timeout_ms,
+                target_lang,
+                request_start,
+                worker_deadline,
+                tx,
+            );
             drop(permit);
             if let Err(e) = &result {
                 warn!(error = %e, "job failed after verdict channel closed");
             }
         });
-        rx.await
-            .map_err(|_| ExecError::Failed("job task dropped before verdict".into()))?
+        let result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline.at), rx)
+            .await
+            .map_err(|_| ExecError::ExecutionDeadline)?
+            .map_err(|_| ExecError::Failed("job task dropped before verdict".into()))?;
+        cancellation.disarm();
+        result
     }
+}
+
+fn execution_budget(cfg: &ExecutorConfig, timeout_ms: u64) -> Result<Duration, ExecError> {
+    [
+        cfg.queue_timeout,
+        cfg.compile_timeout,
+        Duration::from_millis(timeout_ms),
+        BOOT_WAIT,
+        POWEROFF_GRACE,
+    ]
+    .into_iter()
+    .try_fold(Duration::ZERO, |total, part| {
+        total.checked_add(part).ok_or(ExecError::ExecutionDeadline)
+    })
 }
 
 struct JobLayout {
@@ -733,9 +841,10 @@ fn run_sync(
     source: &str,
     timeout_ms: u64,
     lang: ResolvedLanguage,
+    wall_start: Instant,
+    deadline: Deadline,
     tx: oneshot::Sender<Result<JobOutcome, ExecError>>,
 ) -> Result<JobOutcome, ExecError> {
-    let wall_start = Instant::now();
     let t_copy = Instant::now();
     let layout = match prepare_job(cfg) {
         Ok(layout) => layout,
@@ -745,20 +854,29 @@ fn run_sync(
         }
     };
     let copy_ms = t_copy.elapsed().as_millis() as u64;
+    if let Err(error) = deadline.remaining() {
+        cleanup(&layout.jail_root);
+        let _ = tx.send(Err(error.clone()));
+        return Err(error);
+    }
 
     let snap = snap_paths(cfg);
     let restore = cfg.use_snapshot && cfg.use_jailer && snap.ready();
-    let wall = cfg.compile_timeout + Duration::from_millis(timeout_ms) + BOOT_WAIT + POWEROFF_GRACE;
-
     let result = run_vm(
-        cfg, &layout, source, timeout_ms, wall, copy_ms, restore, wall_start, &lang, tx,
+        cfg, &layout, source, timeout_ms, copy_ms, restore, wall_start, &deadline, &lang,
     );
     cleanup(&layout.jail_root);
+    let _ = tx.send(result.clone());
     result
 }
 
 fn prepare_job(cfg: &ExecutorConfig) -> Result<JobLayout, ExecError> {
-    fs::create_dir_all(&cfg.work_dir).map_err(io_err)?;
+    fs::create_dir_all(&cfg.work_dir).map_err(|error| {
+        ExecError::Failed(format!(
+            "create work directory {}: {error}",
+            cfg.work_dir.display()
+        ))
+    })?;
     let cid = NEXT_ID.fetch_add(1, Ordering::Relaxed).max(3);
     let id = format!("job-{cid}");
 
@@ -770,7 +888,10 @@ fn prepare_job(cfg: &ExecutorConfig) -> Result<JobLayout, ExecError> {
 
     let build = || -> Result<JobLayout, ExecError> {
         for dir in ["kernel", "disk", "config", "vsock", "snapshot"] {
-            fs::create_dir_all(jail_root.join(dir)).map_err(io_err)?;
+            let path = jail_root.join(dir);
+            fs::create_dir_all(&path).map_err(|error| {
+                ExecError::Failed(format!("create jail directory {}: {error}", path.display()))
+            })?;
         }
 
         let kernel_dst = jail_root.join("kernel/vmlinux.bin");
@@ -892,44 +1013,43 @@ fn run_vm(
     layout: &JobLayout,
     source: &str,
     timeout_ms: u64,
-    wall: Duration,
     copy_ms: u64,
     restore: bool,
     wall_start: Instant,
+    deadline: &Deadline,
     lang: &ResolvedLanguage,
-    tx: oneshot::Sender<Result<JobOutcome, ExecError>>,
 ) -> Result<JobOutcome, ExecError> {
-    let mut child = match if restore {
+    let operation_deadline = deadline.with_reserve(POWEROFF_GRACE)?;
+    let mut child = if restore {
         spawn_vm(cfg, layout, SpawnMode::ApiOnly, false)
     } else {
         spawn_vm(cfg, layout, SpawnMode::ConfigNoApi, false)
-    } {
-        Ok(child) => child,
-        Err(e) => {
-            let _ = tx.send(Err(e.clone()));
-            return Err(e);
-        }
-    };
+    }?;
     let boot_t0 = Instant::now();
     info!(job = %layout.id, cid = layout.cid, restore, language = %lang.key, "microVM started");
 
     let rpc = (|| {
-        if restore && let Err(e) = load_snapshot(cfg, layout) {
+        if restore && let Err(e) = load_snapshot(cfg, layout, &operation_deadline) {
             warn!(error = %e, "snapshot restore failed; killing VM");
             return Err(e);
         }
-        let mut stream = wait_connect(
-            &layout.host_vsock,
-            BOOT_WAIT.min(wall.saturating_sub(boot_t0.elapsed())),
-        )?;
+        let boot_deadline = Deadline {
+            at: Instant::now()
+                .checked_add(operation_deadline.cap(BOOT_WAIT)?)
+                .ok_or(ExecError::ExecutionDeadline)?,
+            cancelled: operation_deadline.cancelled.clone(),
+        };
+        let mut stream = wait_connect(&layout.host_vsock, &boot_deadline).map_err(|error| {
+            if matches!(error, ExecError::ExecutionDeadline)
+                && operation_deadline.remaining().is_ok()
+            {
+                ExecError::BootTimeout
+            } else {
+                error
+            }
+        })?;
         let boot_ms = boot_t0.elapsed().as_millis() as u64;
-        let job = send_job(
-            &mut stream,
-            source,
-            timeout_ms,
-            lang,
-            wall.saturating_sub(boot_t0.elapsed()),
-        )?;
+        let job = send_job(&mut stream, source, timeout_ms, lang, &operation_deadline)?;
         Ok((job, boot_ms))
     })();
     let (rpc, boot_ms) = match rpc {
@@ -951,21 +1071,7 @@ fn run_vm(
             restored: restore,
             cgroup: cgroup.clone(),
         }),
-        Err(_) if wall_start.elapsed() >= wall => Ok(JobOutcome {
-            job: JobResponse {
-                timed_out: true,
-                compilation_success: true,
-                run_ms: wall_start.elapsed().as_micros() as u64,
-                ..Default::default()
-            },
-            job_id: layout.id.clone(),
-            language: lang.key.clone(),
-            copy_ms,
-            boot_ms,
-            wall_ms,
-            restored: restore,
-            cgroup: cgroup.clone(),
-        }),
+        Err(ExecError::ExecutionDeadline) => Err(ExecError::ExecutionDeadline),
         Err(_) if oom => Ok(JobOutcome {
             job: JobResponse {
                 oom: true,
@@ -983,10 +1089,8 @@ fn run_vm(
         }),
         Err(e) => Err(e),
     };
-    let _ = tx.send(mapped.clone());
-
     let reap_t0 = Instant::now();
-    reap_vm(layout, &mut child);
+    reap_vm(layout, &mut child, Some(deadline));
     info!(
         job = %layout.id,
         reap_ms = reap_t0.elapsed().as_millis() as u64,
@@ -995,8 +1099,12 @@ fn run_vm(
     mapped
 }
 
-fn load_snapshot(cfg: &ExecutorConfig, layout: &JobLayout) -> Result<(), ExecError> {
-    wait_path(&layout.host_api, Duration::from_secs(5))?;
+fn load_snapshot(
+    cfg: &ExecutorConfig,
+    layout: &JobLayout,
+    deadline: &Deadline,
+) -> Result<(), ExecError> {
+    wait_path(&layout.host_api, deadline, Duration::from_secs(5))?;
     let (snap_path, mem_path) = if cfg.use_jailer {
         (
             "/snapshot/vm.snap".to_string(),
@@ -1016,8 +1124,9 @@ fn load_snapshot(cfg: &ExecutorConfig, layout: &JobLayout) -> Result<(), ExecErr
                 .into_owned(),
         )
     };
-    fc_put(
+    fc_http_timeout(
         &layout.host_api,
+        "PUT",
         "/snapshot/load",
         &json!({
             "snapshot_path": snap_path,
@@ -1027,6 +1136,8 @@ fn load_snapshot(cfg: &ExecutorConfig, layout: &JobLayout) -> Result<(), ExecErr
             },
             "resume_vm": true
         }),
+        deadline.cap(SNAP_WAIT)?,
+        Some(deadline),
     )?;
     Ok(())
 }
@@ -1045,9 +1156,10 @@ fn create_golden_snapshot(cfg: &ExecutorConfig) -> Result<(), ExecError> {
     }
     let mut child = spawn_vm(cfg, &layout, SpawnMode::ConfigWithApi, true)?;
     let result = (|| {
-        wait_path(&layout.host_api, BOOT_WAIT)?;
+        let boot_deadline = Deadline::from_now(BOOT_WAIT)?;
+        wait_path(&layout.host_api, &boot_deadline, BOOT_WAIT)?;
         info!("snapshot vm api ready");
-        wait_connect_probe(&layout.host_vsock, BOOT_WAIT)?;
+        wait_connect_probe(&layout.host_vsock, &boot_deadline)?;
         info!("snapshot vm agent listening");
         std::thread::sleep(Duration::from_millis(100));
         fc_patch(&layout.host_api, "/vm", &json!({ "state": "Paused" }))?;
@@ -1082,6 +1194,7 @@ fn create_golden_snapshot(cfg: &ExecutorConfig) -> Result<(), ExecError> {
                 "mem_file_path": mem_path
             }),
             SNAP_CREATE_WAIT,
+            None,
         )?;
         info!("snapshot files written in jail");
         let src_state = layout.jail_root.join("snapshot/vm.snap");
@@ -1091,11 +1204,7 @@ fn create_golden_snapshot(cfg: &ExecutorConfig) -> Result<(), ExecError> {
         chmod_snapshot_group(cfg)?;
         Ok(())
     })();
-    reap_vm(&layout, &mut child);
-    let _ = Command::new("pkill")
-        .args(["-9", "-x", "firecracker"])
-        .status();
-    let _ = Command::new("pkill").args(["-9", "-x", "jailer"]).status();
+    reap_vm(&layout, &mut child, None);
     if let Err(e) = &result
         && let Ok(log) = fs::read_to_string(&fc_log)
     {
@@ -1176,8 +1285,6 @@ fn spawn_vm(
             &format!("cpu.max={}", cfg.jail_cpu_max),
             "--cgroup",
             &format!("pids.max={}", cfg.jail_pids_max),
-            "--seccomp-level",
-            "2",
             "--new-pid-ns",
             "--",
         ]);
@@ -1217,12 +1324,22 @@ fn spawn_vm(
         }
         c
     };
+    cmd.process_group(0);
     cmd.env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(io_err)
+        .map_err(|error| {
+            ExecError::Failed(format!(
+                "spawn {}: {error}",
+                if cfg.use_jailer {
+                    cfg.jailer.display()
+                } else {
+                    cfg.firecracker.display()
+                }
+            ))
+        })
 }
 
 const CGROUP_BASES: &[&str] = &[
@@ -1266,8 +1383,17 @@ fn read_cgroup_stats(job_id: &str) -> CgroupStats {
     CgroupStats::default()
 }
 
-fn reap_vm(layout: &JobLayout, child: &mut Child) {
+fn reap_vm(layout: &JobLayout, child: &mut Child, deadline: Option<&Deadline>) {
+    let child_pid = child.id();
     let _ = child.kill();
+
+    if let Ok(process_group) = i32::try_from(child_pid) {
+        // SAFETY: the child was spawned into a dedicated process group, and the
+        // negative ID targets only that group with a fixed signal.
+        unsafe {
+            libc::kill(-process_group, libc::SIGKILL);
+        }
+    }
 
     for base in CGROUP_BASES {
         let kill_path = format!("{base}/{}/cgroup.kill", layout.id);
@@ -1277,13 +1403,9 @@ fn reap_vm(layout: &JobLayout, child: &mut Child) {
         }
     }
 
-    let pattern = format!("--id {}\\b", layout.id);
-    let _ = Command::new("pkill")
-        .args(["-9", "-f", "--", &pattern])
-        .status();
-
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
+    let reap_limit = Instant::now() + Duration::from_secs(2);
+    let reap_deadline = deadline.map_or(reap_limit, |deadline| deadline.at.min(reap_limit));
+    while Instant::now() < reap_deadline {
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
@@ -1295,8 +1417,10 @@ fn reap_vm(layout: &JobLayout, child: &mut Child) {
         let dir_path = format!("{base}/{}", layout.id);
         let p = Path::new(&dir_path);
         if p.is_dir() {
-            let deadline = Instant::now() + Duration::from_millis(500);
-            while Instant::now() < deadline {
+            let cgroup_limit = Instant::now() + Duration::from_millis(500);
+            let cgroup_deadline =
+                deadline.map_or(cgroup_limit, |deadline| deadline.at.min(cgroup_limit));
+            while Instant::now() < cgroup_deadline {
                 if fs::remove_dir(p).is_ok() || !p.exists() {
                     break;
                 }
@@ -1311,7 +1435,7 @@ fn send_job(
     source: &str,
     timeout_ms: u64,
     lang: &ResolvedLanguage,
-    remaining: Duration,
+    deadline: &Deadline,
 ) -> Result<JobResponse, ExecError> {
     let bytes = serde_json::to_vec(&JobRequest {
         source: source.to_string(),
@@ -1321,68 +1445,72 @@ fn send_job(
         run_cmd: Some(lang.run_cmd.clone()),
     })
     .map_err(|e| ExecError::Failed(e.to_string()))?;
-    write_frame(stream, &bytes).map_err(io_err)?;
+    let remaining = deadline.remaining()?;
+    stream.set_write_timeout(Some(remaining)).map_err(io_err)?;
+    write_frame(stream, &bytes).map_err(|error| {
+        deadline
+            .remaining()
+            .map_or(ExecError::ExecutionDeadline, |_| io_err(error))
+    })?;
     stream
-        .set_read_timeout(Some(remaining.max(Duration::from_secs(1))))
+        .set_read_timeout(Some(deadline.remaining()?))
         .map_err(io_err)?;
-    let resp_bytes = read_frame(stream).map_err(io_err)?;
+    let resp_bytes = read_frame(stream).map_err(|error| {
+        deadline
+            .remaining()
+            .map_or(ExecError::ExecutionDeadline, |_| io_err(error))
+    })?;
     serde_json::from_slice(&resp_bytes).map_err(|e| ExecError::Failed(e.to_string()))
 }
 
-fn wait_connect(uds: &Path, timeout: Duration) -> Result<UnixStream, ExecError> {
-    let start = Instant::now();
-    let mut last = String::new();
-    while start.elapsed() < timeout {
-        match UnixStream::connect(uds) {
-            Ok(mut stream) => {
-                let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
-                let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
-                if stream.write_all(b"CONNECT 52\n").is_err() {
-                    std::thread::sleep(Duration::from_millis(50));
-                    continue;
-                }
-                match read_line_bytes(&mut stream) {
-                    Ok(line) if line.starts_with("OK") => {
-                        let _ = stream.set_read_timeout(None);
-                        let _ = stream.set_write_timeout(None);
-                        return Ok(stream);
-                    }
-                    Ok(line) => last = format!("vsock handshake: {line}"),
-                    Err(e) => last = e.to_string(),
-                }
+fn wait_connect(uds: &Path, deadline: &Deadline) -> Result<UnixStream, ExecError> {
+    loop {
+        let attempt_timeout = deadline.cap(Duration::from_millis(200))?;
+        if let Ok(mut stream) = UnixStream::connect(uds) {
+            let _ = stream.set_read_timeout(Some(attempt_timeout));
+            let _ = stream.set_write_timeout(Some(attempt_timeout));
+            if stream.write_all(b"CONNECT 52\n").is_err() {
+                std::thread::sleep(deadline.cap(Duration::from_millis(50))?);
+                continue;
             }
-            Err(e) => last = e.to_string(),
+            match read_line_bytes(&mut stream) {
+                Ok(line) if line.starts_with("OK") => {
+                    let _ = stream.set_read_timeout(None);
+                    let _ = stream.set_write_timeout(None);
+                    return Ok(stream);
+                }
+                Ok(_) | Err(_) => {}
+            }
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(deadline.cap(Duration::from_millis(50))?);
     }
-    Err(ExecError::Failed(format!("agent vsock not ready: {last}")))
 }
 
-fn wait_connect_probe(uds: &Path, timeout: Duration) -> Result<(), ExecError> {
-    let _stream = wait_connect(uds, timeout)?;
+fn wait_connect_probe(uds: &Path, deadline: &Deadline) -> Result<(), ExecError> {
+    let _stream = wait_connect(uds, deadline)?;
     Ok(())
 }
 
-fn wait_path(path: &Path, timeout: Duration) -> Result<(), ExecError> {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
+fn wait_path(path: &Path, deadline: &Deadline, phase_limit: Duration) -> Result<(), ExecError> {
+    let phase_deadline = Instant::now()
+        .checked_add(deadline.cap(phase_limit)?)
+        .ok_or(ExecError::ExecutionDeadline)?;
+    loop {
         if path.exists() {
             return Ok(());
         }
-        std::thread::sleep(Duration::from_millis(20));
+        if Instant::now() >= phase_deadline {
+            return Err(ExecError::Failed(format!(
+                "timed out waiting for {}",
+                path.display()
+            )));
+        }
+        std::thread::sleep(deadline.cap(Duration::from_millis(20))?);
     }
-    Err(ExecError::Failed(format!(
-        "timed out waiting for {}",
-        path.display()
-    )))
 }
 
 fn fc_patch(sock: &Path, url_path: &str, body: &serde_json::Value) -> Result<(), ExecError> {
-    fc_http_timeout(sock, "PATCH", url_path, body, SNAP_WAIT)
-}
-
-fn fc_put(sock: &Path, url_path: &str, body: &serde_json::Value) -> Result<(), ExecError> {
-    fc_http_timeout(sock, "PUT", url_path, body, SNAP_WAIT)
+    fc_http_timeout(sock, "PATCH", url_path, body, SNAP_WAIT, None)
 }
 
 fn fc_http_timeout(
@@ -1391,23 +1519,50 @@ fn fc_http_timeout(
     url_path: &str,
     body: &serde_json::Value,
     read_timeout: Duration,
+    deadline: Option<&Deadline>,
 ) -> Result<(), ExecError> {
     let payload = serde_json::to_vec(body).map_err(|e| ExecError::Failed(e.to_string()))?;
     let mut stream = UnixStream::connect(sock).map_err(io_err)?;
-    stream
-        .set_read_timeout(Some(read_timeout))
-        .map_err(io_err)?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(10)))
-        .map_err(io_err)?;
     let req = format!(
         "{method} {url_path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         payload.len()
     );
-    stream.write_all(req.as_bytes()).map_err(io_err)?;
-    stream.write_all(&payload).map_err(io_err)?;
+    let mut request = req.into_bytes();
+    request.extend_from_slice(&payload);
+    let write_timeout = deadline
+        .map(|deadline| deadline.cap(Duration::from_secs(10)))
+        .transpose()?
+        .unwrap_or_else(|| read_timeout.min(Duration::from_secs(10)));
+    stream
+        .set_write_timeout(Some(write_timeout))
+        .map_err(io_err)?;
+    stream.write_all(&request).map_err(|error| {
+        if deadline.is_some_and(|deadline| deadline.remaining().is_err()) {
+            ExecError::ExecutionDeadline
+        } else {
+            io_err(error)
+        }
+    })?;
+    if let Some(deadline) = deadline {
+        stream
+            .set_write_timeout(Some(deadline.remaining()?))
+            .map_err(io_err)?;
+    }
     stream.flush().map_err(io_err)?;
-    let text = read_http_response(&mut stream)?;
+    let effective_read_timeout = deadline
+        .map(|deadline| deadline.cap(read_timeout))
+        .transpose()?
+        .unwrap_or(read_timeout);
+    stream
+        .set_read_timeout(Some(effective_read_timeout))
+        .map_err(io_err)?;
+    let text = read_http_response(&mut stream).map_err(|error| {
+        if deadline.is_some_and(|deadline| deadline.remaining().is_err()) {
+            ExecError::ExecutionDeadline
+        } else {
+            error
+        }
+    })?;
     let status = text
         .lines()
         .next()
@@ -1476,11 +1631,20 @@ fn chmod_snapshot_group(cfg: &ExecutorConfig) -> Result<(), ExecError> {
 }
 
 fn hardlink_or_copy(src: &Path, dst: &Path) -> Result<(), ExecError> {
+    let source = fs::canonicalize(src).map_err(|error| {
+        ExecError::Failed(format!("resolve runtime asset {}: {error}", src.display()))
+    })?;
     let _ = fs::remove_file(dst);
-    if fs::hard_link(src, dst).is_ok() {
+    if fs::hard_link(&source, dst).is_ok() {
         return Ok(());
     }
-    fs::copy(src, dst).map_err(io_err)?;
+    fs::copy(&source, dst).map_err(|error| {
+        ExecError::Failed(format!(
+            "copy runtime asset {} to {}: {error}",
+            source.display(),
+            dst.display()
+        ))
+    })?;
     Ok(())
 }
 
@@ -1570,28 +1734,57 @@ mod tests {
         assert!(validate_cpu_max("200000 100000 extra").is_err());
     }
 
+    #[test]
+    fn deadline_caps_phases_and_observes_cancellation() {
+        let deadline = Deadline::from_now(Duration::from_secs(1)).unwrap();
+        assert!(deadline.cap(Duration::from_millis(10)).unwrap() <= Duration::from_millis(10));
+        deadline.cancel();
+        assert!(matches!(
+            deadline.remaining(),
+            Err(ExecError::ExecutionDeadline)
+        ));
+    }
+
+    #[test]
+    fn expired_deadline_fails_immediately() {
+        let deadline = Deadline::from_now(Duration::ZERO).unwrap();
+        assert!(matches!(
+            deadline.remaining(),
+            Err(ExecError::ExecutionDeadline)
+        ));
+    }
+
     #[tokio::test]
     async fn execution_limiter_runs_up_to_configured_capacity() {
         let limiter = ExecutionLimiter::new(2, 0, Duration::from_secs(1));
-        let first = limiter.acquire().await.unwrap();
-        let second = limiter.acquire().await.unwrap();
+        let deadline = Deadline::from_now(Duration::from_secs(1)).unwrap();
+        let first = limiter.acquire(&deadline).await.unwrap();
+        let second = limiter.acquire(&deadline).await.unwrap();
 
-        assert!(matches!(limiter.acquire().await, Err(ExecError::QueueFull)));
+        assert!(matches!(
+            limiter.acquire(&deadline).await,
+            Err(ExecError::QueueFull)
+        ));
 
         drop(first);
         drop(second);
-        assert!(limiter.acquire().await.is_ok());
+        assert!(limiter.acquire(&deadline).await.is_ok());
     }
 
     #[tokio::test]
     async fn execution_limiter_bounds_the_waiting_queue() {
         let limiter = ExecutionLimiter::new(1, 1, Duration::from_secs(1));
-        let running = limiter.acquire().await.unwrap();
+        let deadline = Deadline::from_now(Duration::from_secs(1)).unwrap();
+        let running = limiter.acquire(&deadline).await.unwrap();
         let queued_limiter = limiter.clone();
-        let queued = tokio::spawn(async move { queued_limiter.acquire().await });
+        let queued_deadline = deadline.clone();
+        let queued = tokio::spawn(async move { queued_limiter.acquire(&queued_deadline).await });
         tokio::task::yield_now().await;
 
-        assert!(matches!(limiter.acquire().await, Err(ExecError::QueueFull)));
+        assert!(matches!(
+            limiter.acquire(&deadline).await,
+            Err(ExecError::QueueFull)
+        ));
 
         drop(running);
         assert!(queued.await.unwrap().is_ok());
@@ -1600,28 +1793,47 @@ mod tests {
     #[tokio::test]
     async fn execution_limiter_times_out_queued_work() {
         let limiter = ExecutionLimiter::new(1, 1, Duration::from_millis(1));
-        let _running = limiter.acquire().await.unwrap();
+        let deadline = Deadline::from_now(Duration::from_secs(1)).unwrap();
+        let _running = limiter.acquire(&deadline).await.unwrap();
 
-        assert!(matches!(limiter.acquire().await, Err(ExecError::Busy)));
-        assert!(matches!(limiter.acquire().await, Err(ExecError::Busy)));
+        assert!(matches!(
+            limiter.acquire(&deadline).await,
+            Err(ExecError::Busy)
+        ));
+        assert!(matches!(
+            limiter.acquire(&deadline).await,
+            Err(ExecError::Busy)
+        ));
     }
 
     #[tokio::test]
     async fn execution_limiter_reclaims_cancelled_queue_admission() {
         let limiter = ExecutionLimiter::new(1, 1, Duration::from_millis(1));
-        let _running = limiter.acquire().await.unwrap();
+        let deadline = Deadline::from_now(Duration::from_secs(1)).unwrap();
+        let _running = limiter.acquire(&deadline).await.unwrap();
         let queued_limiter = limiter.clone();
-        let queued = tokio::spawn(async move { queued_limiter.acquire().await });
+        let queued_deadline = deadline.clone();
+        let queued = tokio::spawn(async move { queued_limiter.acquire(&queued_deadline).await });
         tokio::task::yield_now().await;
         queued.abort();
         let _ = queued.await;
 
-        assert!(matches!(limiter.acquire().await, Err(ExecError::Busy)));
+        assert!(matches!(
+            limiter.acquire(&deadline).await,
+            Err(ExecError::Busy)
+        ));
     }
 
     #[test]
     fn http_204_does_not_wait_for_peer_close() {
-        let path = std::env::temp_dir().join(format!("grade-fc-http-{}.sock", std::process::id()));
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "cratera-fc-http-{}-{unique}.sock",
+            std::process::id()
+        ));
         let _ = fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
         let server = thread::spawn(move || {
@@ -1640,13 +1852,14 @@ mod tests {
         client.flush().unwrap();
         let started = Instant::now();
         let text = read_http_response(&mut client).unwrap();
-        let _ = fs::remove_file(&path);
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "must not wait for the peer to close"
         );
         assert!(text.contains("204"));
-        drop(server);
+        drop(client);
+        server.join().unwrap();
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
@@ -1654,6 +1867,30 @@ mod tests {
         let raw = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 5\r\n\r\nbad!!";
         let text = read_http_response(&mut Cursor::new(&raw[..])).unwrap();
         assert!(text.ends_with("bad!!"));
+    }
+
+    #[test]
+    fn hardlink_or_copy_dereferences_symlink_sources() {
+        use std::os::unix::fs::symlink;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("cratera-hardlink-{}-{unique}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let source = dir.join("rootfs.squashfs");
+        let link = dir.join("rootfs.ext4");
+        let destination = dir.join("jail-rootfs.ext4");
+        fs::write(&source, b"rootfs").unwrap();
+        symlink("rootfs.squashfs", &link).unwrap();
+
+        hardlink_or_copy(&link, &destination).unwrap();
+
+        assert!(!fs::symlink_metadata(&destination).unwrap().is_symlink());
+        assert_eq!(fs::read(&destination).unwrap(), b"rootfs");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

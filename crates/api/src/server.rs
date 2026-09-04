@@ -60,7 +60,11 @@ pub fn log_file_path() -> PathBuf {
 pub fn get_server_pid() -> Option<u32> {
     let pid_file = pid_file_path();
     if let Ok(content) = fs::read_to_string(&pid_file) {
-        content.trim().parse::<u32>().ok()
+        content
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|pid| PathBuf::from(format!("/proc/{pid}")).exists())
     } else {
         None
     }
@@ -87,12 +91,12 @@ pub async fn get_server_addr() -> String {
 pub async fn stop_server() -> bool {
     let pid_path = pid_file_path();
     let mut stopped = false;
+    let managed_pid = get_server_pid();
 
-    if let Some(pid) = get_server_pid() {
+    if let Some(pid) = managed_pid {
         let _ = std::process::Command::new("kill")
             .args(["-15", &pid.to_string()])
             .output();
-        let _ = fs::remove_file(&pid_path);
         stopped = true;
     }
 
@@ -100,12 +104,13 @@ pub async fn stop_server() -> bool {
     for _ in 0..20 {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         if !is_server_running().await {
+            let _ = fs::remove_file(&pid_path);
             return true;
         }
     }
 
     // If still alive, issue SIGKILL
-    if let Some(pid) = get_server_pid() {
+    if let Some(pid) = managed_pid {
         let _ = std::process::Command::new("kill")
             .args(["-9", &pid.to_string()])
             .output();
@@ -125,7 +130,7 @@ pub async fn start_server_background() -> anyhow::Result<String> {
         if let Some(pid) = get_server_pid() {
             return Ok(format!("{bind_addr} [PID {pid}]"));
         }
-        return Ok(bind_addr);
+        anyhow::bail!("{bind_addr} is already in use by an unmanaged process or system service");
     }
 
     let exe = std::env::current_exe().context("Failed to get current binary path")?;
@@ -347,6 +352,28 @@ pub async fn harness(
                 Json(
                     serde_json::json!({"error":"queue full","code":"queue_full","unavailable":true}),
                 ),
+            ))
+        }
+        Err(ExecError::ExecutionDeadline) => {
+            tracing::error!(language = %language, reason = "execution_deadline", "job_record");
+            Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({
+                    "error":"execution deadline exceeded",
+                    "code":"execution_deadline",
+                    "unavailable":true
+                })),
+            ))
+        }
+        Err(ExecError::BootTimeout) => {
+            tracing::error!(language = %language, reason = "boot_timeout", "job_record");
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error":"microVM boot timed out",
+                    "code":"boot_timeout",
+                    "unavailable":true
+                })),
             ))
         }
         Err(ExecError::Failed(msg)) => {

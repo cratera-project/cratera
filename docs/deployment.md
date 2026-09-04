@@ -15,26 +15,36 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/opt/cratera
+EnvironmentFile=-/opt/cratera/.env
+
+# Runtime configuration
 Environment=NODE_ENV=production
 Environment=CRATERA_BIND=127.0.0.1:3100
+
+# Firecracker binaries and guest assets
 Environment=CRATERA_FIRECRACKER=/usr/local/bin/firecracker
 Environment=CRATERA_JAILER=/usr/local/bin/jailer
 Environment=CRATERA_KERNEL=/opt/cratera/images/vmlinux.bin
 Environment=CRATERA_ROOTFS=/opt/cratera/images/rootfs.ext4
 Environment=CRATERA_WORK_DIR=/var/lib/cratera
+
+# Jailer and snapshot configuration
 Environment=CRATERA_USE_JAILER=1
 Environment=CRATERA_JAIL_UID=20001
 Environment=CRATERA_JAIL_GID=20001
 Environment=CRATERA_USE_SNAPSHOT=1
 Environment=CRATERA_SNAPSHOT_DIR=/opt/cratera/images/snapshot
-EnvironmentFile=-/opt/cratera/.env
-ExecStart=/opt/cratera/cratera
+
+ExecStart=/opt/cratera/cratera serve
+
+# Process lifecycle and resource limits
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=65536
 Delegate=yes
 KillMode=mixed
 
+# Restrict service networking to localhost.
 IPAddressDeny=any
 IPAddressAllow=localhost
 

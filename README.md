@@ -177,7 +177,8 @@ Send a `POST /harness` request to execute code in an isolated microVM instance. 
 | `400` | Invalid request payload or missing required `code` parameter. |
 | `401` | Missing or invalid Bearer authentication token. |
 | `500` | Internal infrastructure or microVM initialization failure. |
-| `503` | The bounded queue is full (`queue_full`) or its wait deadline elapsed (`queue_timeout`). |
+| `503` | The bounded queue is full (`queue_full`), its wait deadline elapsed (`queue_timeout`), or the microVM failed to boot (`boot_timeout`). |
+| `504` | The end-to-end submission lifecycle exceeded its deadline (`execution_deadline`). |
 
 ### Running Examples
 
@@ -304,7 +305,14 @@ Type=simple
 User=root
 WorkingDirectory=/opt/cratera
 EnvironmentFile=-/opt/cratera/.env
-ExecStart=/opt/cratera/cratera
+Environment=NODE_ENV=production
+Environment=CRATERA_FIRECRACKER=/usr/local/bin/firecracker
+Environment=CRATERA_JAILER=/usr/local/bin/jailer
+Environment=CRATERA_KERNEL=/opt/cratera/images/vmlinux.bin
+Environment=CRATERA_ROOTFS=/opt/cratera/images/rootfs.ext4
+Environment=CRATERA_WORK_DIR=/var/lib/cratera
+Environment=CRATERA_USE_JAILER=1
+ExecStart=/usr/bin/env NODE_ENV=production CRATERA_FIRECRACKER=/usr/local/bin/firecracker CRATERA_JAILER=/usr/local/bin/jailer CRATERA_KERNEL=/opt/cratera/images/vmlinux.bin CRATERA_ROOTFS=/opt/cratera/images/rootfs.ext4 CRATERA_WORK_DIR=/var/lib/cratera CRATERA_USE_JAILER=1 /opt/cratera/cratera serve
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=65536

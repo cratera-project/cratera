@@ -6,6 +6,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/opt/cratera
+EnvironmentFile=-/opt/cratera/.env
 Environment=NODE_ENV=production
 Environment=CRATERA_BIND=127.0.0.1:3100
 Environment=CRATERA_FIRECRACKER=/usr/local/bin/firecracker
@@ -18,8 +19,9 @@ Environment=CRATERA_JAIL_UID=20001
 Environment=CRATERA_JAIL_GID=20001
 Environment=CRATERA_USE_SNAPSHOT=1
 Environment=CRATERA_SNAPSHOT_DIR=/opt/cratera/images/snapshot
-EnvironmentFile=-/opt/cratera/.env
-ExecStart=/opt/cratera/cratera
+# ExecStart assignments intentionally override development paths that may be
+# present in .env; systemd EnvironmentFile values otherwise win over Environment.
+ExecStart=/usr/bin/env NODE_ENV=production CRATERA_BIND=127.0.0.1:3100 CRATERA_FIRECRACKER=/usr/local/bin/firecracker CRATERA_JAILER=/usr/local/bin/jailer CRATERA_KERNEL=/opt/cratera/images/vmlinux.bin CRATERA_ROOTFS=/opt/cratera/images/rootfs.ext4 CRATERA_WORK_DIR=/var/lib/cratera CRATERA_USE_JAILER=1 CRATERA_JAIL_UID=20001 CRATERA_JAIL_GID=20001 CRATERA_USE_SNAPSHOT=1 CRATERA_SNAPSHOT_DIR=/opt/cratera/images/snapshot /opt/cratera/cratera serve
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=65536

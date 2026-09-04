@@ -32,8 +32,19 @@ Cratera is configured through environment variables or a `.env` file located in 
 | `CRATERA_JAIL_GID` | `20001` | Dedicated unprivileged GID for the jailed Firecracker process. |
 | `CRATERA_USE_SNAPSHOT` | `0` | Set `1` to enable fast snapshot restore (~5ms boot). |
 | `CRATERA_SNAPSHOT_DIR` | `./images/snapshot` | Directory holding the golden microVM memory and guest CPU state. |
+| `NODE_ENV` | `development` | Set `production` for the systemd service; enables strict API-key and guest-image checks and requires Jailer. |
+| `RUST_LOG` | `cratera=info,...` | `tracing` filter for coordinator, executor, and HTTP logs (for example `cratera=debug`). |
+| `CRATERA_LANGUAGE` | `rust` | Default language key when a request omits `language`. Must exist in `languages.toml`. |
+| `CRATERA_LANGUAGES_FILE` | auto-discovered `languages.toml` | Optional path to the language registry. Relative paths resolve from the process working directory. |
+| `CRATERA_SOURCE_FILE` | generated per job | Optional source filename template used by custom compiler commands. |
+| `CRATERA_COMPILE_CMD` | language registry command | Optional compile command override; use `{file}` for the generated source path. |
+| `CRATERA_RUN_CMD` | language registry command | Optional run command override for the compiled artifact. |
 
-Invalid resource values fail server startup instead of silently falling back. When raising concurrency, reserve at least `CRATERA_MAX_CONCURRENT_JOBS × CRATERA_JAIL_MEM_MAX` bytes of host memory, plus capacity for the coordinator and operating system.
+Invalid resource values fail server startup instead of silently falling back. Numeric values are decimal integers; durations are milliseconds unless explicitly marked seconds. `CRATERA_JAIL_CPU_MAX` is two decimal integers (`quota period`) or `max period` for unlimited CPU. When raising concurrency, reserve at least `CRATERA_MAX_CONCURRENT_JOBS × CRATERA_JAIL_MEM_MAX` bytes of host memory, plus capacity for the coordinator and operating system.
+
+In production, `deploy/cratera.service` deliberately enforces the Firecracker, Jailer, kernel, rootfs, work-directory, bind, and Jailer policy paths through `ExecStart`; development `.env` values for those fields do not override the service. Kernel and rootfs images must have adjacent `.sha256` sidecars.
+
+Each request has one overflow-safe absolute deadline spanning queue admission, job preparation, VM boot or restore, guest execution, and teardown. Its budget is derived from the configured queue, compilation, requested execution, boot, and cleanup allowances. Infrastructure deadline failures return HTTP `504` with code `execution_deadline`; guest runtime timeouts remain normal verdict responses.
 
 ---
 

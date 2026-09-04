@@ -17,8 +17,10 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 # Load API key and bind address from .env if present
-INTERNAL_KEY=$(grep '^CRATERA_INTERNAL_KEY=' .env 2>/dev/null | cut -d= -f2 || echo "dev-key")
-BIND_ADDR=$(grep '^CRATERA_BIND=' .env 2>/dev/null | cut -d= -f2 || echo "127.0.0.1:3100")
+INTERNAL_KEY="${CRATERA_INTERNAL_KEY:-$(grep '^CRATERA_INTERNAL_KEY=' .env 2>/dev/null | cut -d= -f2 || true)}"
+INTERNAL_KEY="${INTERNAL_KEY:-dev-key}"
+BIND_ADDR="${CRATERA_BIND:-$(grep '^CRATERA_BIND=' .env 2>/dev/null | cut -d= -f2 || true)}"
+BIND_ADDR="${BIND_ADDR:-127.0.0.1:3100}"
 URL="http://${BIND_ADDR}/harness"
 
 LANG="${1:-python}"

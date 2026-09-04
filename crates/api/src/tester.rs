@@ -3,7 +3,6 @@ use cratera_executor::{ExecutorConfig, FirecrackerExecutor};
 use std::path::Path;
 
 const GREEN: &str = "\x1b[32m";
-const YELLOW: &str = "\x1b[33m";
 const RED: &str = "\x1b[31m";
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
@@ -16,33 +15,24 @@ pub async fn run_test(args: &[String]) -> anyhow::Result<()> {
 
     let kvm = Path::new("/dev/kvm");
     if !kvm.exists() {
-        eprintln!("{RED}Error:{RESET} /dev/kvm not found. Hardware virtualization required.");
-        return Ok(());
+        anyhow::bail!("/dev/kvm not found; hardware virtualization is required");
     }
 
     let cfg = ExecutorConfig::try_from_env().map_err(anyhow::Error::msg)?;
     if !cfg.firecracker.exists() {
-        eprintln!(
-            "{RED}Error:{RESET} Firecracker binary missing at: {}",
+        anyhow::bail!(
+            "Firecracker binary missing at {}; run ./scripts/fetch-runtime.sh",
             cfg.firecracker.display()
         );
-        eprintln!("Run ./scripts/fetch-runtime.sh to download runtime assets.");
-        return Ok(());
     }
     if !cfg.kernel.exists() {
-        eprintln!(
-            "{RED}Error:{RESET} Guest kernel missing at: {}",
-            cfg.kernel.display()
-        );
-        return Ok(());
+        anyhow::bail!("guest kernel missing at {}", cfg.kernel.display());
     }
     if !cfg.rootfs.exists() {
-        eprintln!(
-            "{RED}Error:{RESET} Rootfs image missing at: {}",
+        anyhow::bail!(
+            "rootfs image missing at {}; run ./scripts/build-rootfs.sh or 'cratera build'",
             cfg.rootfs.display()
         );
-        eprintln!("Run ./scripts/build-rootfs.sh or 'cratera build' to generate rootfs.");
-        return Ok(());
     }
 
     let executor = FirecrackerExecutor::new(cfg.clone());
@@ -135,8 +125,8 @@ pub async fn run_test(args: &[String]) -> anyhow::Result<()> {
     }
 
     if tested == 0 {
-        println!(
-            "{YELLOW}No matching languages found to test.{RESET} (Filter: {:?})",
+        anyhow::bail!(
+            "no enabled language matched the test filter {:?}",
             target_filter
         );
     } else {
@@ -145,6 +135,10 @@ pub async fn run_test(args: &[String]) -> anyhow::Result<()> {
             " Summary: {GREEN}{passed} passed{RESET}, {RED}{failed} failed{RESET} out of {tested} tested."
         );
         println!("{BOLD}───────────────────────────────────────────────────────────────{RESET}\n");
+    }
+
+    if failed > 0 {
+        anyhow::bail!("{failed} of {tested} in-guest smoke tests failed");
     }
 
     Ok(())
