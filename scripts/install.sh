@@ -86,14 +86,20 @@ echo ""
 # -----------------------------------------------------------------------------
 echo -e "${BOLD}[1/7] Checking hardware & host prerequisites...${RESET}"
 
+OS="$(uname -s)"
 ARCH="$(uname -m)"
-if [[ "$ARCH" != "x86_64" ]]; then
-  echo -e "${YELLOW}  ! Warning: Host architecture is $ARCH (Firecracker prebuilts are x86_64).${RESET}"
+if [[ "$OS" != "Linux" ]]; then
+  echo -e "${RED}  ✗ Unsupported host OS: $OS. The KVM installer requires Linux.${RESET}" >&2
+  echo "    For local development and unit tests, run: cargo test --workspace" >&2
+  echo "    For microVM execution, use a Linux VM or WSL2 with nested KVM exposed." >&2
+  exit 1
 fi
 
-if [[ "$(uname -s)" != "Linux" ]]; then
-  echo -e "${YELLOW}  ! Warning: Non-Linux OS detected ($(uname -s)). Firecracker requires Linux KVM.${RESET}"
-  echo "    For macOS/Windows, ensure nested virtualization is enabled in your VM/WSL2."
+if [[ "$ARCH" != "x86_64" ]]; then
+  echo -e "${RED}  ✗ Unsupported host architecture: $ARCH. Firecracker runtime assets require x86_64 Linux.${RESET}" >&2
+  echo "    For local development and unit tests, run: cargo test --workspace" >&2
+  echo "    For microVM execution, use an x86_64 Linux VM with KVM exposed." >&2
+  exit 1
 fi
 
 if [[ -e /dev/kvm ]]; then
@@ -140,7 +146,11 @@ echo ""
 # -----------------------------------------------------------------------------
 echo -e "${BOLD}[2/7] Configuring host KVM & Jailer isolation...${RESET}"
 
-if id -u jailer >/dev/null 2>&1 && [[ -d /var/lib/cratera ]] && [[ -r /dev/kvm && -w /dev/kvm ]]; then
+if [[ "$(id -u jailer 2>/dev/null || true)" == "20001" ]] \
+  && [[ "$(id -g jailer 2>/dev/null || true)" == "20001" ]] \
+  && getent group 20001 >/dev/null 2>&1 \
+  && [[ -d /var/lib/cratera ]] \
+  && [[ -r /dev/kvm && -w /dev/kvm ]]; then
   echo -e "${GREEN}  ✓ Host Jailer user (UID 20001) and /var/lib/cratera ready${RESET}"
 else
   if [[ "$UNATTENDED" -eq 1 ]]; then
@@ -164,6 +174,11 @@ else
       echo "  Skipping sudo host setup."
     fi
   fi
+fi
+
+if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+  echo -e "${RED}  ✗ /dev/kvm is unavailable after host setup. Enable KVM and rerun the installer.${RESET}" >&2
+  exit 1
 fi
 
 echo ""

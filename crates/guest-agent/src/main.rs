@@ -6,8 +6,8 @@ use std::io::{self, Read};
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use vsock::{VMADDR_CID_ANY, VsockAddr, VsockListener};
@@ -290,6 +290,24 @@ fn pidfd_kill(fd: i32, sig: i32) {
     };
 }
 
+fn wait_for_pidfd(fd: i32, timeout: Duration) -> io::Result<bool> {
+    let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+    let mut pollfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let result = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+        if result >= 0 {
+            return Ok(result > 0);
+        }
+        if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return Err(io::Error::last_os_error());
+        }
+    }
+}
+
 fn run_cmd(mut cmd: Command, timeout: Duration, sample_rss: bool) -> CmdOut {
     let stdout_path = Path::new("/tmp/job.stdout");
     let stderr_path = Path::new("/tmp/job.stderr");
@@ -329,27 +347,57 @@ fn run_cmd(mut cmd: Command, timeout: Duration, sample_rss: bool) -> CmdOut {
     let start = Instant::now();
     let pidfd = pidfd_open(pid);
     let finished = Arc::new(AtomicBool::new(false));
-    let timed_out = Arc::new(AtomicBool::new(false));
+    let command_state = Arc::new(Mutex::new(CommandState::Running));
     let peak = Arc::new(AtomicU64::new(live_rss_kb(pid)));
 
-    {
+    let pidfd_timeout = if let Some(fd) = pidfd {
+        match wait_for_pidfd(fd, timeout) {
+            Ok(true) => false,
+            Ok(false) | Err(_) => {
+                // Keep the state transition and pidfd signal together. If the
+                // process exited at the deadline, pidfd_send_signal fails and
+                // the completed process is reported normally.
+                let mut state = command_state.lock().expect("command state lock poisoned");
+                if *state != CommandState::Running {
+                    false
+                } else if unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        fd,
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::c_void>(),
+                        0i32,
+                    )
+                } >= 0
+                {
+                    *state = CommandState::TimedOut;
+                    true
+                } else {
+                    *state = CommandState::Finished;
+                    false
+                }
+            }
+        }
+    } else {
         let finished = Arc::clone(&finished);
-        let timed_out = Arc::clone(&timed_out);
+        let command_state = Arc::clone(&command_state);
         thread::spawn(move || {
             thread::sleep(timeout);
             if finished.load(Ordering::SeqCst) {
                 return;
             }
-            timed_out.store(true, Ordering::SeqCst);
-            if let Some(fd) = pidfd {
-                pidfd_kill(fd, libc::SIGKILL);
-            } else {
-                unsafe {
-                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            if claim_timeout(&command_state) {
+                if let Some(fd) = pidfd {
+                    pidfd_kill(fd, libc::SIGKILL);
+                } else {
+                    unsafe {
+                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                    }
                 }
             }
         });
-    }
+        false
+    };
 
     if sample_rss {
         let finished = Arc::clone(&finished);
@@ -363,6 +411,11 @@ fn run_cmd(mut cmd: Command, timeout: Duration, sample_rss: bool) -> CmdOut {
     }
 
     let waited = wait4_pid(pid);
+    let timed_out = if pidfd.is_some() {
+        pidfd_timeout
+    } else {
+        finish_command(&command_state)
+    };
     finished.store(true, Ordering::SeqCst);
     let elapsed_us = start.elapsed().as_micros() as u64;
 
@@ -380,7 +433,7 @@ fn run_cmd(mut cmd: Command, timeout: Duration, sample_rss: bool) -> CmdOut {
             } else {
                 0
             };
-            if timed_out.load(Ordering::SeqCst) {
+            if timed_out {
                 return failed(read_cap(stderr_path), true, memory_kb, elapsed_us);
             }
             CmdOut::Done {
@@ -397,6 +450,31 @@ fn run_cmd(mut cmd: Command, timeout: Duration, sample_rss: bool) -> CmdOut {
             failed(e.to_string(), false, 0, elapsed_us)
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandState {
+    Running,
+    Finished,
+    TimedOut,
+}
+
+fn claim_timeout(state: &Mutex<CommandState>) -> bool {
+    let mut state = state.lock().expect("command state lock poisoned");
+    if *state != CommandState::Running {
+        return false;
+    }
+    *state = CommandState::TimedOut;
+    true
+}
+
+fn finish_command(state: &Mutex<CommandState>) -> bool {
+    let mut state = state.lock().expect("command state lock poisoned");
+    let timed_out = *state == CommandState::TimedOut;
+    if !timed_out {
+        *state = CommandState::Finished;
+    }
+    timed_out
 }
 
 fn read_cap(path: &Path) -> String {
@@ -425,7 +503,8 @@ fn halt() -> ! {
 
 #[cfg(test)]
 mod tests {
-    use super::{measured_rss_kb, parse_status_kb};
+    use super::{CommandState, claim_timeout, finish_command, measured_rss_kb, parse_status_kb};
+    use std::sync::Mutex;
 
     #[test]
     fn parses_rss_anon_not_file_rss() {
@@ -440,5 +519,17 @@ mod tests {
         assert_eq!(measured_rss_kb(31), 0);
         assert_eq!(measured_rss_kb(32), 32);
         assert_eq!(measured_rss_kb(400), 400);
+    }
+
+    #[test]
+    fn timeout_and_exit_have_one_synchronized_winner() {
+        let state = Mutex::new(CommandState::Running);
+        assert!(!finish_command(&state));
+        assert!(!claim_timeout(&state));
+
+        let state = Mutex::new(CommandState::Running);
+        assert!(claim_timeout(&state));
+        assert!(finish_command(&state));
+        assert_eq!(*state.lock().unwrap(), CommandState::TimedOut);
     }
 }

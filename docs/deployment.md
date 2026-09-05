@@ -143,7 +143,7 @@ Fields:
 
 | Field | Meaning |
 | :--- | :--- |
-| `job_id` | Jailer/Firecracker id (`job-N`) |
+| `job_id` | Jailer/Firecracker id (`job-<process>-<timestamp>-<cid>`, unique across coordinator restarts) |
 | `language` | Resolved language key |
 | `verdict` | `AC`, `WA`, `TLE`, `MLE`, `RE`, `CE` |
 | `timed_out` / `oom` | Guest timeout or SIGKILL/OOM |

@@ -9,9 +9,9 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tracing::{info, warn};
 
@@ -43,7 +43,22 @@ const MIN_MEM_MIB: u32 = 128;
 const MAX_MEM_MIB: u32 = 65_536;
 const MAX_JAIL_PIDS: u32 = 65_536;
 
-static NEXT_ID: AtomicU32 = AtomicU32::new(3);
+static NEXT_CID: AtomicU32 = AtomicU32::new(3);
+static PROCESS_ID: OnceLock<String> = OnceLock::new();
+
+fn process_id() -> &'static str {
+    PROCESS_ID.get_or_init(|| {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        format!("{}-{timestamp}", std::process::id())
+    })
+}
+
+fn host_job_id(cid: u32) -> String {
+    format!("job-{}-{cid}", process_id())
+}
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ExecError {
@@ -982,8 +997,8 @@ fn prepare_job(cfg: &ExecutorConfig) -> Result<JobLayout, ExecError> {
             cfg.work_dir.display()
         ))
     })?;
-    let cid = NEXT_ID.fetch_add(1, Ordering::Relaxed).max(3);
-    let id = format!("job-{cid}");
+    let cid = NEXT_CID.fetch_add(1, Ordering::Relaxed).max(3);
+    let id = host_job_id(cid);
 
     let jail_root = if cfg.use_jailer {
         cfg.work_dir.join("firecracker").join(&id).join("root")
@@ -2194,5 +2209,13 @@ mod tests {
         assert_eq!(jail_cpu_max_value(2, None), "200000 100000");
         assert_eq!(jail_cpu_max_value(1, None), "100000 100000");
         assert_eq!(jail_cpu_max_value(2, Some("50000 100000")), "50000 100000");
+    }
+
+    #[test]
+    fn host_job_id_is_process_unique_and_keeps_numeric_cid_suffix() {
+        let id = host_job_id(3);
+        assert!(id.starts_with("job-"));
+        assert!(id.ends_with("-3"));
+        assert_ne!(id, "job-3");
     }
 }

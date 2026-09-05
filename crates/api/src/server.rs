@@ -122,9 +122,7 @@ pub async fn stop_server() -> bool {
 }
 
 pub async fn start_server_background() -> anyhow::Result<String> {
-    let bind_addr = std::env::var("CRATERA_BIND")
-        .or_else(|_| std::env::var("GRADE_BIND"))
-        .unwrap_or_else(|_| "127.0.0.1:3100".into());
+    let bind_addr = configured_bind_addr()?.to_string();
 
     if is_server_running().await {
         if let Some(pid) = get_server_pid() {
@@ -154,7 +152,7 @@ pub async fn start_server_background() -> anyhow::Result<String> {
     #[cfg(unix)]
     cmd.process_group(0); // Detach process group so closing parent terminal won't kill child
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .context("Failed to spawn background cratera server process")?;
     let pid = child.id();
@@ -166,12 +164,25 @@ pub async fn start_server_background() -> anyhow::Result<String> {
         if is_server_running().await {
             return Ok(format!("{bind_addr} [PID {pid}]"));
         }
+        if let Some(status) = child
+            .try_wait()
+            .context("Failed to inspect background server")?
+        {
+            anyhow::bail!(
+                "background server exited before becoming ready (status {status}); see {}",
+                log_path.display()
+            );
+        }
     }
 
-    Ok(format!("{bind_addr} [PID {pid}]"))
+    anyhow::bail!(
+        "background server did not become ready at {bind_addr}; see {}",
+        log_path.display()
+    )
 }
 
 pub async fn start_server() -> anyhow::Result<()> {
+    let addr = configured_bind_addr()?;
     let key = std::env::var("CRATERA_INTERNAL_KEY")
         .or_else(|_| std::env::var("GRADE_INTERNAL_KEY"))
         .unwrap_or_else(|_| {
@@ -179,9 +190,9 @@ pub async fn start_server() -> anyhow::Result<()> {
             "dev-key".into()
         });
     let production = std::env::var("NODE_ENV").as_deref() == Ok("production");
-    if production && api_key_unfit_for_production(&key) {
+    if (!addr.ip().is_loopback() || production) && api_key_unfit_for_production(&key) {
         anyhow::bail!(
-            "CRATERA_INTERNAL_KEY is a placeholder or shorter than 16 characters; set a random production key"
+            "CRATERA_INTERNAL_KEY is required and must be a random key of at least 16 characters when binding off-loopback (or in production)"
         );
     }
 
@@ -242,11 +253,6 @@ pub async fn start_server() -> anyhow::Result<()> {
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_SIZE))
         .with_state(state);
 
-    let addr: SocketAddr = std::env::var("CRATERA_BIND")
-        .or_else(|_| std::env::var("GRADE_BIND"))
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 3100)));
     if production && !addr.ip().is_loopback() {
         anyhow::bail!("CRATERA_BIND must be loopback in production (got {addr})");
     }
@@ -264,6 +270,14 @@ pub async fn harness(
 ) -> Result<Json<HarnessResult>, (StatusCode, Json<serde_json::Value>)> {
     if !bearer_ok(&headers, &state.internal_key) {
         return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+
+    if !matches!(req.mode.as_str(), "run" | "submit") {
+        return Err(json_err_with_code(
+            StatusCode::BAD_REQUEST,
+            "unsupported mode",
+            "unsupported_mode",
+        ));
     }
 
     let resolved_lang = state
@@ -292,7 +306,7 @@ pub async fn harness(
             (src, state.run_timeout_ms)
         }
         "submit" => (source, state.submit_timeout_ms),
-        _ => (source, state.run_timeout_ms),
+        _ => unreachable!("harness mode was validated above"),
     };
     let time_ms = time_ms.min(state.max_time_ms);
     let language = resolved_lang.key.clone();
@@ -379,8 +393,8 @@ pub async fn harness(
         Err(ExecError::Failed(msg)) => {
             tracing::error!(language = %language, error = %msg, "job_record");
             Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error":"judge failed","unavailable":true})),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error":"internal error","code":"internal_error"})),
             ))
         }
     }
@@ -418,9 +432,33 @@ fn json_err(status: StatusCode, message: &str) -> (StatusCode, Json<serde_json::
     (status, Json(serde_json::json!({"error": message})))
 }
 
+fn json_err_with_code(
+    status: StatusCode,
+    message: &str,
+    code: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        status,
+        Json(serde_json::json!({"error": message, "code": code})),
+    )
+}
+
+fn configured_bind_addr() -> anyhow::Result<SocketAddr> {
+    let bind = std::env::var("CRATERA_BIND")
+        .or_else(|_| std::env::var("GRADE_BIND"))
+        .unwrap_or_else(|_| "127.0.0.1:3100".into());
+    parse_bind_addr(&bind)
+}
+
+fn parse_bind_addr(bind: &str) -> anyhow::Result<SocketAddr> {
+    bind.parse::<SocketAddr>()
+        .with_context(|| format!("CRATERA_BIND must be a valid socket address (got {bind})"))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::api_key_unfit_for_production;
+    use super::{api_key_unfit_for_production, parse_bind_addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     #[test]
     fn rejects_short_and_example_keys() {
@@ -430,5 +468,28 @@ mod tests {
         assert!(!api_key_unfit_for_production(
             "a-sufficiently-long-random-token"
         ));
+    }
+
+    #[test]
+    fn bind_parser_supports_ipv4_and_ipv6_socket_addresses() {
+        let ipv4: SocketAddr = "127.0.0.1:3100".parse().unwrap();
+        let ipv6: SocketAddr = "[::1]:3100".parse().unwrap();
+        assert_eq!(ipv4.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(ipv6.ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
+        assert!(
+            !"0.0.0.0:3100"
+                .parse::<SocketAddr>()
+                .unwrap()
+                .ip()
+                .is_loopback()
+        );
+        assert!(
+            !"[::]:3100"
+                .parse::<SocketAddr>()
+                .unwrap()
+                .ip()
+                .is_loopback()
+        );
+        assert!(parse_bind_addr("localhost:3100").is_err());
     }
 }
