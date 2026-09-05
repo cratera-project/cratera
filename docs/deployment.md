@@ -88,6 +88,30 @@ WantedBy=multi-user.target
 
 ---
 
+## Host `jailer` Account
+
+Running `scripts/host-setup.sh` provisions the host service identity named
+`jailer` with UID and GID `20001`. It has no home directory and uses
+`/usr/sbin/nologin`; it is a locked, non-interactive account intended only for
+the Firecracker Jailer.
+
+The coordinator starts Firecracker through Jailer, which drops the VM process
+to this UID/GID before applying the chroot and cgroup restrictions. Cratera
+also uses the numeric UID for VM file ownership and host firewall rules that
+block jailed processes from opening network connections. Keep UID/GID `20001`
+reserved for this purpose. Do not delete the account or assign either ID to a
+different user or group, or existing ownership and isolation rules can be
+weakened.
+
+`CRATERA_USE_JAILER=0` is suitable only for local development. It removes the
+Jailer privilege drop, chroot, and cgroup boundary, and snapshot restore is
+unavailable without Jailer. Production configuration rejects this setting.
+
+The account name is an implementation detail, but renaming it is not a
+supported routine customization: the host setup script currently expects the
+name `jailer`. If it must be renamed, retain UID/GID `20001` and update the
+setup and operational tooling together.
+
 ## Service Installation & Management
 
 ### One-Command Installation
