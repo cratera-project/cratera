@@ -26,6 +26,7 @@ const SNAP_WAIT: Duration = Duration::from_secs(60);
 const SNAP_CREATE_WAIT: Duration = Duration::from_secs(180);
 const SNAP_LOCK_WAIT: Duration = Duration::from_secs(60);
 const SNAPSHOT_FINGERPRINT_VERSION: &str = "cratera-snapshot-v1";
+const UNIX_SOCKET_PATH_MAX: usize = 108;
 const JAIL_MEMORY_MAX: &str = "3221225472";
 const CPU_PERIOD_US: u32 = 100_000;
 
@@ -52,8 +53,25 @@ fn process_id() -> &'static str {
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
             .unwrap_or_default();
-        format!("{}-{timestamp}", std::process::id())
+        // Keep job paths short enough for Linux sockaddr_un (108 bytes). A
+        // decimal nanosecond timestamp made the CI worktree's vsock path
+        // exactly 108 bytes, which prevents Firecracker from creating it.
+        format!("{}-{}", std::process::id(), base36(timestamp))
     })
+}
+
+fn base36(mut value: u128) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    if value == 0 {
+        return "0".into();
+    }
+    let mut encoded = Vec::new();
+    while value != 0 {
+        encoded.push(DIGITS[(value % 36) as usize]);
+        value /= 36;
+    }
+    encoded.reverse();
+    String::from_utf8(encoded).expect("base36 digits are valid UTF-8")
 }
 
 fn host_job_id(cid: u32) -> String {
@@ -1042,6 +1060,25 @@ fn prepare_job(cfg: &ExecutorConfig) -> Result<JobLayout, ExecError> {
             )
         };
 
+        let host_vsock = jail_root.join("vsock/job.sock");
+        if uds_path.len() >= UNIX_SOCKET_PATH_MAX {
+            return Err(ExecError::Failed(format!(
+                "vsock socket path is too long ({} bytes; limit {})",
+                uds_path.len(),
+                UNIX_SOCKET_PATH_MAX - 1
+            )));
+        }
+        // With the jailer, Firecracker sees the short in-jail path above,
+        // while the coordinator connects through this host-side path.
+        let host_vsock_len = host_vsock.to_string_lossy().len();
+        if host_vsock_len >= UNIX_SOCKET_PATH_MAX {
+            return Err(ExecError::Failed(format!(
+                "host vsock socket path is too long ({} bytes; limit {})",
+                host_vsock_len,
+                UNIX_SOCKET_PATH_MAX - 1
+            )));
+        }
+
         let vm = vm_config_json(
             &kernel_path,
             &rootfs_path,
@@ -1063,7 +1100,7 @@ fn prepare_job(cfg: &ExecutorConfig) -> Result<JobLayout, ExecError> {
 
         Ok(JobLayout {
             id,
-            host_vsock: jail_root.join("vsock/job.sock"),
+            host_vsock,
             host_api: jail_root.join("api.sock"),
             jail_root: jail_root.clone(),
             vm_json,
@@ -1159,15 +1196,16 @@ fn run_vm(
                 .ok_or(ExecError::ExecutionDeadline)?,
             cancelled: operation_deadline.cancelled.clone(),
         };
-        let mut stream = wait_connect(&layout.host_vsock, &boot_deadline).map_err(|error| {
-            if matches!(error, ExecError::ExecutionDeadline)
-                && operation_deadline.remaining().is_ok()
-            {
-                ExecError::BootTimeout
-            } else {
-                error
-            }
-        })?;
+        let mut stream = wait_connect(&layout.host_vsock, &boot_deadline, Some(&mut child))
+            .map_err(|error| {
+                if matches!(error, ExecError::ExecutionDeadline)
+                    && operation_deadline.remaining().is_ok()
+                {
+                    ExecError::BootTimeout
+                } else {
+                    error
+                }
+            })?;
         let boot_ms = boot_t0.elapsed().as_millis() as u64;
         let job = send_job(&mut stream, source, timeout_ms, lang, &operation_deadline)?;
         Ok((job, boot_ms))
@@ -1287,7 +1325,7 @@ fn create_golden_snapshot(cfg: &ExecutorConfig, fingerprint: &str) -> Result<(),
         let boot_deadline = Deadline::from_now(BOOT_WAIT)?;
         wait_path(&layout.host_api, &boot_deadline, BOOT_WAIT)?;
         info!("snapshot vm api ready");
-        wait_connect_probe(&layout.host_vsock, &boot_deadline)?;
+        wait_connect_probe(&layout.host_vsock, &boot_deadline, &mut child)?;
         info!("snapshot vm agent listening");
         std::thread::sleep(Duration::from_millis(100));
         fc_patch(&layout.host_api, "/vm", &json!({ "state": "Paused" }))?;
@@ -1628,8 +1666,23 @@ fn send_job(
     serde_json::from_slice(&resp_bytes).map_err(|e| ExecError::Failed(e.to_string()))
 }
 
-fn wait_connect(uds: &Path, deadline: &Deadline) -> Result<UnixStream, ExecError> {
+fn wait_connect(
+    uds: &Path,
+    deadline: &Deadline,
+    mut child: Option<&mut Child>,
+) -> Result<UnixStream, ExecError> {
     loop {
+        if let Some(child) = child.as_deref_mut() {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    return Err(ExecError::Failed(format!(
+                        "firecracker exited before vsock became ready: {status}"
+                    )));
+                }
+                Ok(None) => {}
+                Err(error) => return Err(io_err(error)),
+            }
+        }
         let attempt_timeout = deadline.cap(Duration::from_millis(200))?;
         if let Ok(mut stream) = UnixStream::connect(uds) {
             let _ = stream.set_read_timeout(Some(attempt_timeout));
@@ -1651,8 +1704,8 @@ fn wait_connect(uds: &Path, deadline: &Deadline) -> Result<UnixStream, ExecError
     }
 }
 
-fn wait_connect_probe(uds: &Path, deadline: &Deadline) -> Result<(), ExecError> {
-    let _stream = wait_connect(uds, deadline)?;
+fn wait_connect_probe(uds: &Path, deadline: &Deadline, child: &mut Child) -> Result<(), ExecError> {
+    let _stream = wait_connect(uds, deadline, Some(child))?;
     Ok(())
 }
 
@@ -2217,5 +2270,17 @@ mod tests {
         assert!(id.starts_with("job-"));
         assert!(id.ends_with("-3"));
         assert_ne!(id, "job-3");
+    }
+
+    #[test]
+    fn host_job_vsock_path_fits_github_actions_worktree() {
+        let path = Path::new("/home/runner/work/cratera/cratera/target/cratera-smoke.XXXXXX")
+            .join(host_job_id(3))
+            .join("vsock/job.sock");
+        assert!(
+            path.to_string_lossy().len() < UNIX_SOCKET_PATH_MAX,
+            "vsock path is too long: {} bytes",
+            path.to_string_lossy().len()
+        );
     }
 }
