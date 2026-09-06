@@ -108,27 +108,65 @@ Cratera is organized as a Cargo workspace:
 
 ## Quickstart
 
+### Local development without KVM
+
+You can build the workspace and run unit and contract tests on any platform
+with a supported Rust toolchain. These checks do not start Firecracker
+microVMs:
+
+```bash
+git clone https://github.com/cratera-project/cratera.git
+cd cratera
+cargo test --workspace
+```
+
+To exercise microVM execution, use x86_64 Linux with `/dev/kvm`, or a Linux VM
+or WSL2 installation that exposes nested KVM. The KVM installer below exits
+early on other hosts.
+
 ### Prerequisites
 
 - Linux on x86_64 with `/dev/kvm` hardware virtualization.
 - Docker or rootless Podman to build the guest root filesystem.
-- Rust toolchain 1.80+ if building from source.
+- Rust toolchain 1.97+ if building from source.
 
 ### Installation
 
 **Option A: Automated setup script (Recommended)**
 ```bash
-# Clones, downloads kernel, builds guest rootfs, and compiles cratera
+# Clones, downloads the kernel, builds a minimal Rust-only guest rootfs, and compiles cratera
 git clone https://github.com/cratera-project/cratera.git
 cd cratera
-./scripts/install.sh
+./scripts/install.sh --yes
 ```
+The installer keeps the default image small and quick to build. To install every
+configured language explicitly, use `./scripts/install.sh --yes --languages=all`.
+Use `--languages=<preset>` or `--languages=<language,language>` for another selection.
+
+### Start the coordinator
+
+From the repository root, start the verified release binary:
+```bash
+./target/release/cratera serve
+```
+The installer leaves systemd disabled by default. To opt into the production
+service after installation, run `./target/release/cratera service enable`.
+For the production systemd unit, host permissions, and private ingress guidance,
+see [docs/deployment.md](docs/deployment.md).
 
 **Option B: Install binary via Cargo**
 ```bash
 cargo install cratera
 ```
-*Note: The binary requires guest images (kernel and rootfs); run `./scripts/install.sh` or `cratera doctor` to verify environment assets.*
+This installs the coordinator binary only. It does not download Firecracker,
+the guest kernel, or build the rootfs it needs for execution. On an x86_64
+Linux host, run `./scripts/install.sh --yes` from a checkout to provision those
+runtime assets, or use `cratera doctor` to check an existing asset setup.
+
+The default installer provisions only Rust for a small, quick first image.
+Enable additional languages explicitly with `--languages=<preset>` or
+`--languages=<language,language>`; use `--languages=all` only when the full
+language image is required.
 
 ---
 
@@ -177,6 +215,8 @@ Send a `POST /harness` request to execute code in an isolated microVM instance. 
 | `400` | Invalid request payload or missing required `code` parameter. |
 | `401` | Missing or invalid Bearer authentication token. |
 | `500` | Internal infrastructure or microVM initialization failure. |
+| `503` | The bounded queue is full (`queue_full`), its wait deadline elapsed (`queue_timeout`), or the microVM failed to boot (`boot_timeout`). |
+| `504` | The end-to-end submission lifecycle exceeded its deadline (`execution_deadline`). |
 
 ### Running Examples
 
@@ -260,7 +300,7 @@ Each entry in [`languages.toml`](languages.toml) defines how a compiler is insta
 To change which languages are available in the root filesystem:
 
 1. Update [`languages.toml`](languages.toml) or run `cratera lang` to toggle runtimes.
-2. Rebuild the root filesystem with `./scripts/build-rootfs.sh` (or `cratera build`).
+2. Rebuild the root filesystem with `./scripts/install.sh --yes --languages=all` (or `./scripts/build-rootfs.sh`).
 
 For recipe options and examples, read [docs/languages.md](docs/languages.md).
 
@@ -278,6 +318,9 @@ Cratera reads settings from environment variables or a `.env` file:
 | `CRATERA_MEM_MIB` | `2048` | Guest RAM allocated per microVM in MiB. |
 | `CRATERA_RUN_MS` | `2000` | Execution time limit for test runs in milliseconds. |
 | `CRATERA_SUBMIT_MS` | `5000` | Execution time limit for submissions in milliseconds. |
+| `CRATERA_MAX_CONCURRENT_JOBS` | `1` | Maximum number of microVM jobs executing simultaneously. |
+| `CRATERA_MAX_QUEUED_JOBS` | `64` | Maximum submissions waiting for an execution slot. |
+| `CRATERA_QUEUE_TIMEOUT_MS` | `10000` | Maximum queue wait in milliseconds. |
 | `CRATERA_USE_JAILER` | `0` | Development default: `0` (disabled for local testing; production systemd service sets `1` for UID 20001 chroot). |
 
 For the complete list of variables and defaults, see [docs/configuration.md](docs/configuration.md).
@@ -300,7 +343,14 @@ Type=simple
 User=root
 WorkingDirectory=/opt/cratera
 EnvironmentFile=-/opt/cratera/.env
-ExecStart=/opt/cratera/cratera
+Environment=NODE_ENV=production
+Environment=CRATERA_FIRECRACKER=/usr/local/bin/firecracker
+Environment=CRATERA_JAILER=/usr/local/bin/jailer
+Environment=CRATERA_KERNEL=/opt/cratera/images/vmlinux.bin
+Environment=CRATERA_ROOTFS=/opt/cratera/images/rootfs.ext4
+Environment=CRATERA_WORK_DIR=/var/lib/cratera
+Environment=CRATERA_USE_JAILER=1
+ExecStart=/usr/bin/env NODE_ENV=production CRATERA_FIRECRACKER=/usr/local/bin/firecracker CRATERA_JAILER=/usr/local/bin/jailer CRATERA_KERNEL=/opt/cratera/images/vmlinux.bin CRATERA_ROOTFS=/opt/cratera/images/rootfs.ext4 CRATERA_WORK_DIR=/var/lib/cratera CRATERA_USE_JAILER=1 /opt/cratera/cratera serve
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=65536
@@ -372,12 +422,12 @@ For setup guides and examples, see [docs/deployment.md](docs/deployment.md#ingre
 
 ### Permission denied on `/dev/kvm`
 
-Add your user account to the `kvm` group:
+Add your user account to the `kvm` group, then start a new login shell:
 ```bash
 sudo usermod -aG kvm $USER
 newgrp kvm
 ```
-*Note: Membership in the `kvm` group grants access to host virtualization ioctls; treat it as a privileged capability.*
+The host setup script keeps `/dev/kvm` owned by `root:kvm` with mode `0660`, including after device recreation. Membership in the `kvm` group grants access to host virtualization ioctls; treat it as a privileged capability.
 
 ### Language not found in manifest
 

@@ -41,10 +41,13 @@ enabled = true   # Flip between true and false anytime
 
 Then rebuild the microVM rootfs with:
 ```bash
-./scripts/install.sh
+# The installer defaults to a minimal Rust-only image.
+./scripts/install.sh --yes --languages=all
 # or
 ./scripts/build-rootfs.sh
 ```
+Use `--languages=<preset>` (for example, `minimal`, `systems`, or `web`) or a
+comma-separated list such as `--languages=rust,python` to choose a smaller image.
 
 ---
 
@@ -176,4 +179,5 @@ apt_prereqs = ["libc6-dev"]
 test_code = "print('OK')"
 ```
 
-Run `./scripts/install.sh` and Cratera will immediately assemble the runtime into the hardware microVM image.
+Run `./scripts/install.sh --yes --languages=all` and Cratera will assemble the
+runtime into the hardware microVM image.

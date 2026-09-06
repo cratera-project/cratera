@@ -3,14 +3,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fs;
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, Instant};
-use tokio::sync::{Semaphore, oneshot};
+use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tracing::{info, warn};
 
 mod image_hash;
@@ -22,6 +24,10 @@ const BOOT_WAIT: Duration = Duration::from_secs(20);
 const POWEROFF_GRACE: Duration = Duration::from_secs(3);
 const SNAP_WAIT: Duration = Duration::from_secs(60);
 const SNAP_CREATE_WAIT: Duration = Duration::from_secs(180);
+const SNAP_LOCK_WAIT: Duration = Duration::from_secs(60);
+const SNAP_READ_LOCK_WAIT: Duration = Duration::from_millis(500);
+const SNAPSHOT_FINGERPRINT_VERSION: &str = "cratera-snapshot-v1";
+const UNIX_SOCKET_PATH_MAX: usize = 108;
 const JAIL_MEMORY_MAX: &str = "3221225472";
 const CPU_PERIOD_US: u32 = 100_000;
 
@@ -32,15 +38,135 @@ fn jail_cpu_max_value(vcpu: u8, override_val: Option<&str>) -> String {
     format!("{} {CPU_PERIOD_US}", u32::from(vcpu.max(1)) * CPU_PERIOD_US)
 }
 const SNAP_MEMORY_MAX: &str = "6442450944";
+const MAX_CONCURRENT_JOBS_LIMIT: usize = 1024;
+const MAX_QUEUED_JOBS_LIMIT: usize = 100_000;
+const MAX_VCPU: u8 = 32;
+const MIN_MEM_MIB: u32 = 128;
+const MAX_MEM_MIB: u32 = 65_536;
+const MAX_JAIL_PIDS: u32 = 65_536;
 
-static NEXT_ID: AtomicU32 = AtomicU32::new(3);
+static NEXT_CID: AtomicU32 = AtomicU32::new(3);
+static PROCESS_ID: OnceLock<String> = OnceLock::new();
+
+fn process_id() -> &'static str {
+    PROCESS_ID.get_or_init(|| {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        // Keep job paths short enough for Linux sockaddr_un (108 bytes). A
+        // decimal nanosecond timestamp made the CI worktree's vsock path
+        // exactly 108 bytes, which prevents Firecracker from creating it.
+        format!("{}-{}", std::process::id(), base36(timestamp))
+    })
+}
+
+fn base36(mut value: u128) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    if value == 0 {
+        return "0".into();
+    }
+    let mut encoded = Vec::new();
+    while value != 0 {
+        encoded.push(DIGITS[(value % 36) as usize]);
+        value /= 36;
+    }
+    encoded.reverse();
+    String::from_utf8(encoded).expect("base36 digits are valid UTF-8")
+}
+
+fn host_job_id(cid: u32) -> String {
+    format!("job-{}-{cid}", process_id())
+}
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ExecError {
-    #[error("busy")]
+    #[error("executor queue wait timed out")]
     Busy,
+    #[error("executor queue is full")]
+    QueueFull,
+    #[error("execution deadline exceeded")]
+    ExecutionDeadline,
+    #[error("microVM boot timed out")]
+    BootTimeout,
     #[error("{0}")]
     Failed(String),
+}
+
+#[derive(Clone)]
+struct Deadline {
+    at: Instant,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Deadline {
+    fn from_now(budget: Duration) -> Result<Self, ExecError> {
+        let at = Instant::now()
+            .checked_add(budget)
+            .ok_or(ExecError::ExecutionDeadline)?;
+        Ok(Self {
+            at,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    fn remaining(&self) -> Result<Duration, ExecError> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(ExecError::ExecutionDeadline);
+        }
+        self.at
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(ExecError::ExecutionDeadline)
+    }
+
+    fn cap(&self, phase_limit: Duration) -> Result<Duration, ExecError> {
+        Ok(self.remaining()?.min(phase_limit))
+    }
+
+    fn with_reserve(&self, reserve: Duration) -> Result<Self, ExecError> {
+        let at = self
+            .at
+            .checked_sub(reserve)
+            .ok_or(ExecError::ExecutionDeadline)?;
+        if at <= Instant::now() {
+            return Err(ExecError::ExecutionDeadline);
+        }
+        Ok(Self {
+            at,
+            cancelled: self.cancelled.clone(),
+        })
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+struct CancellationGuard {
+    deadline: Deadline,
+    armed: bool,
+}
+
+impl CancellationGuard {
+    fn new(deadline: Deadline) -> Self {
+        Self {
+            deadline,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancellationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.deadline.cancel();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -340,6 +466,9 @@ pub struct ExecutorConfig {
     pub vcpu: u8,
     pub mem_mib: u32,
     pub compile_timeout: Duration,
+    pub max_concurrent_jobs: usize,
+    pub max_queued_jobs: usize,
+    pub queue_timeout: Duration,
     pub jail_mem_max: String,
     pub jail_cpu_max: String,
     pub jail_pids_max: u32,
@@ -348,11 +477,31 @@ pub struct ExecutorConfig {
 
 impl ExecutorConfig {
     pub fn from_env() -> Self {
+        Self::try_from_env()
+            .unwrap_or_else(|error| panic!("invalid executor configuration: {error}"))
+    }
+
+    pub fn try_from_env() -> Result<Self, String> {
         fn env_path(cratera_key: &str, grade_key: &str, default: &str) -> PathBuf {
             let val = std::env::var(cratera_key)
                 .or_else(|_| std::env::var(grade_key))
                 .unwrap_or_else(|_| default.to_string());
             PathBuf::from(val)
+        }
+        fn env_parse<T>(key: &str, legacy_key: Option<&str>, default: T) -> Result<T, String>
+        where
+            T: FromStr,
+            T::Err: std::fmt::Display,
+        {
+            let value = std::env::var(key)
+                .ok()
+                .or_else(|| legacy_key.and_then(|legacy| std::env::var(legacy).ok()));
+            match value {
+                Some(raw) => raw
+                    .parse()
+                    .map_err(|error| format!("{key} must be a valid value: {error}")),
+                None => Ok(default),
+            }
         }
         fn env_flag_dual(cratera_key: &str, grade_key: &str, default: bool) -> bool {
             std::env::var(cratera_key)
@@ -378,30 +527,31 @@ impl ExecutorConfig {
                     .unwrap_or_else(|| Path::new("."))
                     .join("snapshot")
             });
-        let vcpu = std::env::var("CRATERA_VCPU")
-            .or_else(|_| std::env::var("GRADE_VCPU"))
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(GUEST_VCPU);
-        let mem_mib = std::env::var("CRATERA_MEM_MIB")
-            .or_else(|_| std::env::var("GRADE_MEM_MIB"))
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(GUEST_MEM_MIB);
-        let compile_timeout_secs = std::env::var("CRATERA_COMPILE_TIMEOUT_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(12);
+        let vcpu = env_parse("CRATERA_VCPU", Some("GRADE_VCPU"), GUEST_VCPU)?;
+        let mem_mib = env_parse("CRATERA_MEM_MIB", Some("GRADE_MEM_MIB"), GUEST_MEM_MIB)?;
+        let compile_timeout_secs = env_parse("CRATERA_COMPILE_TIMEOUT_SECS", None, 12_u64)?;
+        let max_concurrent_jobs = env_parse("CRATERA_MAX_CONCURRENT_JOBS", None, 1_usize)?;
+        let max_queued_jobs = env_parse("CRATERA_MAX_QUEUED_JOBS", None, 64_usize)?;
+        let queue_timeout_ms = env_parse("CRATERA_QUEUE_TIMEOUT_MS", None, 10_000_u64)?;
         let jail_mem_max =
             std::env::var("CRATERA_JAIL_MEM_MAX").unwrap_or_else(|_| JAIL_MEMORY_MAX.into());
         let jail_cpu_max =
             jail_cpu_max_value(vcpu, std::env::var("CRATERA_JAIL_CPU_MAX").ok().as_deref());
-        let jail_pids_max = std::env::var("CRATERA_JAIL_PIDS_MAX")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(64);
+        let jail_pids_max = env_parse("CRATERA_JAIL_PIDS_MAX", None, 64_u32)?;
 
-        Self {
+        validate_resource_config(&ResourceConfig {
+            vcpu,
+            mem_mib,
+            jail_mem_max: &jail_mem_max,
+            jail_cpu_max: &jail_cpu_max,
+            jail_pids_max,
+            max_concurrent_jobs,
+            max_queued_jobs,
+            queue_timeout_ms,
+            compile_timeout_secs,
+        })?;
+
+        Ok(Self {
             firecracker: env_path(
                 "CRATERA_FIRECRACKER",
                 "GRADE_FIRECRACKER",
@@ -427,11 +577,14 @@ impl ExecutorConfig {
             vcpu,
             mem_mib,
             compile_timeout: Duration::from_secs(compile_timeout_secs),
+            max_concurrent_jobs,
+            max_queued_jobs,
+            queue_timeout: Duration::from_millis(queue_timeout_ms),
             jail_mem_max,
             jail_cpu_max,
             jail_pids_max,
             languages: LanguageRegistry::from_env_or_file(),
-        }
+        })
     }
 
     pub fn verify_guest_images(&self, require_checksums: bool) -> Result<(), String> {
@@ -451,21 +604,196 @@ impl ExecutorConfig {
     }
 }
 
+struct ResourceConfig<'a> {
+    vcpu: u8,
+    mem_mib: u32,
+    jail_mem_max: &'a str,
+    jail_cpu_max: &'a str,
+    jail_pids_max: u32,
+    max_concurrent_jobs: usize,
+    max_queued_jobs: usize,
+    queue_timeout_ms: u64,
+    compile_timeout_secs: u64,
+}
+
+fn validate_resource_config(config: &ResourceConfig<'_>) -> Result<(), String> {
+    if !(1..=MAX_VCPU).contains(&config.vcpu) {
+        return Err(format!("CRATERA_VCPU must be between 1 and {MAX_VCPU}"));
+    }
+    if !(MIN_MEM_MIB..=MAX_MEM_MIB).contains(&config.mem_mib) {
+        return Err(format!(
+            "CRATERA_MEM_MIB must be between {MIN_MEM_MIB} and {MAX_MEM_MIB}"
+        ));
+    }
+    let jail_mem_bytes = config
+        .jail_mem_max
+        .parse::<u64>()
+        .map_err(|_| "CRATERA_JAIL_MEM_MAX must be a byte count".to_string())?;
+    let guest_mem_bytes = u64::from(config.mem_mib)
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| "CRATERA_MEM_MIB is too large".to_string())?;
+    if jail_mem_bytes < guest_mem_bytes {
+        return Err("CRATERA_JAIL_MEM_MAX must be at least CRATERA_MEM_MIB in bytes".to_string());
+    }
+    validate_cpu_max(config.jail_cpu_max)?;
+    if !(1..=MAX_JAIL_PIDS).contains(&config.jail_pids_max) {
+        return Err(format!(
+            "CRATERA_JAIL_PIDS_MAX must be between 1 and {MAX_JAIL_PIDS}"
+        ));
+    }
+    if !(1..=MAX_CONCURRENT_JOBS_LIMIT).contains(&config.max_concurrent_jobs) {
+        return Err(format!(
+            "CRATERA_MAX_CONCURRENT_JOBS must be between 1 and {MAX_CONCURRENT_JOBS_LIMIT}"
+        ));
+    }
+    if config.max_queued_jobs > MAX_QUEUED_JOBS_LIMIT {
+        return Err(format!(
+            "CRATERA_MAX_QUEUED_JOBS must not exceed {MAX_QUEUED_JOBS_LIMIT}"
+        ));
+    }
+    if config.queue_timeout_ms == 0 {
+        return Err("CRATERA_QUEUE_TIMEOUT_MS must be greater than 0".to_string());
+    }
+    if config.compile_timeout_secs == 0 {
+        return Err("CRATERA_COMPILE_TIMEOUT_SECS must be greater than 0".to_string());
+    }
+    Ok(())
+}
+
+fn validate_cpu_max(value: &str) -> Result<(), String> {
+    let mut fields = value.split_whitespace();
+    let quota = fields
+        .next()
+        .ok_or_else(|| "CRATERA_JAIL_CPU_MAX must contain quota and period".to_string())?;
+    let period = fields
+        .next()
+        .ok_or_else(|| "CRATERA_JAIL_CPU_MAX must contain quota and period".to_string())?;
+    if fields.next().is_some() {
+        return Err("CRATERA_JAIL_CPU_MAX must contain exactly quota and period".to_string());
+    }
+    if quota != "max" {
+        let parsed = quota
+            .parse::<u64>()
+            .map_err(|_| "CRATERA_JAIL_CPU_MAX quota must be positive or 'max'".to_string())?;
+        if parsed == 0 {
+            return Err("CRATERA_JAIL_CPU_MAX quota must be positive".to_string());
+        }
+    }
+    let period = period
+        .parse::<u64>()
+        .map_err(|_| "CRATERA_JAIL_CPU_MAX period must be an integer".to_string())?;
+    if !(1_000..=1_000_000).contains(&period) {
+        return Err("CRATERA_JAIL_CPU_MAX period must be between 1000 and 1000000".to_string());
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
 pub struct FirecrackerExecutor {
     cfg: ExecutorConfig,
+    limiter: ExecutionLimiter,
+    active_jobs: ActiveJobs,
+    shutting_down: Arc<AtomicBool>,
+}
+
+type ActiveJobs = Arc<Mutex<std::collections::HashMap<String, u32>>>;
+
+#[derive(Clone)]
+struct ExecutionLimiter {
     slots: Arc<Semaphore>,
+    admissions: Arc<Semaphore>,
+    queue_timeout: Duration,
+}
+
+struct ExecutionPermit {
+    _slot: OwnedSemaphorePermit,
+    _admission: OwnedSemaphorePermit,
+}
+
+impl ExecutionLimiter {
+    fn new(max_concurrent: usize, max_queued: usize, queue_timeout: Duration) -> Self {
+        let max_concurrent = max_concurrent.clamp(1, MAX_CONCURRENT_JOBS_LIMIT);
+        let max_queued = max_queued.min(MAX_QUEUED_JOBS_LIMIT);
+        Self {
+            slots: Arc::new(Semaphore::new(max_concurrent)),
+            admissions: Arc::new(Semaphore::new(max_concurrent.saturating_add(max_queued))),
+            queue_timeout,
+        }
+    }
+
+    async fn acquire(&self, deadline: &Deadline) -> Result<ExecutionPermit, ExecError> {
+        let admission =
+            self.admissions
+                .clone()
+                .try_acquire_owned()
+                .map_err(|error| match error {
+                    tokio::sync::TryAcquireError::NoPermits => ExecError::QueueFull,
+                    tokio::sync::TryAcquireError::Closed => {
+                        ExecError::Failed("executor closed".into())
+                    }
+                })?;
+        let queue_wait = deadline.cap(self.queue_timeout)?;
+        let slot = match tokio::time::timeout(queue_wait, self.slots.clone().acquire_owned()).await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => return Err(ExecError::Failed("executor closed".into())),
+            Err(_) => return Err(ExecError::Busy),
+        };
+        Ok(ExecutionPermit {
+            _slot: slot,
+            _admission: admission,
+        })
+    }
+
+    /// Wake all waiters and prevent new admissions during executor shutdown.
+    ///
+    /// Closing both semaphores is intentional: a waiter may already hold an
+    /// admission permit while waiting for a running slot. Tokio wakes both
+    /// classes of waiters, and any partially acquired admission permit is
+    /// dropped by `acquire` on the closed-slot error path.
+    fn shutdown(&self) {
+        self.admissions.close();
+        self.slots.close();
+    }
 }
 
 impl FirecrackerExecutor {
     pub fn new(cfg: ExecutorConfig) -> Self {
+        let limiter = ExecutionLimiter::new(
+            cfg.max_concurrent_jobs,
+            cfg.max_queued_jobs,
+            cfg.queue_timeout,
+        );
         Self {
             cfg,
-            slots: Arc::new(Semaphore::new(1)),
+            limiter,
+            active_jobs: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            shutting_down: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn config(&self) -> &ExecutorConfig {
         &self.cfg
+    }
+
+    /// Stop jobs owned by this executor. Every process and cgroup target is
+    /// derived from the job registry, so shutdown cannot affect another
+    /// Cratera instance or an unrelated Firecracker process.
+    pub fn shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+        self.limiter.shutdown();
+        let active = self
+            .active_jobs
+            .lock()
+            .map(|jobs| {
+                jobs.iter()
+                    .map(|(id, pid)| (id.clone(), *pid))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for (job_id, pid) in active {
+            kill_job_resources(&job_id, pid);
+        }
     }
 
     pub fn ensure_snapshot(&self) -> Result<(), ExecError> {
@@ -476,8 +804,18 @@ impl FirecrackerExecutor {
             warn!("CRATERA_USE_SNAPSHOT ignored without jailer (vsock paths are not portable)");
             return Ok(());
         }
+        // Serialize both validation and publication. Snapshot files are
+        // shared across service processes and are replaced as a unit.
+        let _snapshot_lock = acquire_snapshot_lock(&self.cfg)?;
         let snap = snap_paths(&self.cfg);
-        if snap.ready() {
+        let fingerprint = match snapshot_fingerprint(&self.cfg) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                invalidate_snapshot(&self.cfg);
+                return Err(error);
+            }
+        };
+        if snap.matches_fingerprint(&fingerprint) {
             info!(
                 snap = %snap.state.display(),
                 mem = %snap.mem.display(),
@@ -485,12 +823,18 @@ impl FirecrackerExecutor {
             );
             return Ok(());
         }
+        if snap.ready() {
+            info!(
+                snap = %snap.state.display(),
+                "existing Firecracker snapshot fingerprint is stale; rebuilding"
+            );
+        }
         info!("creating Firecracker snapshot (agent listen)");
-        create_golden_snapshot(&self.cfg)?;
+        create_golden_snapshot(&self.cfg, &fingerprint)?;
         chmod_snapshot_group(&self.cfg)?;
-        if !snap.ready() {
+        if !snap.matches_fingerprint(&fingerprint) {
             return Err(ExecError::Failed(
-                "snapshot create did not write files".into(),
+                "snapshot create did not publish matching files".into(),
             ));
         }
         info!(
@@ -507,16 +851,17 @@ impl FirecrackerExecutor {
         timeout_ms: u64,
         lang: Option<ResolvedLanguage>,
     ) -> Result<JobOutcome, ExecError> {
-        let permit = match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            self.slots.clone().acquire_owned(),
-        )
-        .await
-        {
-            Ok(Ok(p)) => p,
-            Ok(Err(_)) => return Err(ExecError::Failed("executor closed".into())),
-            Err(_) => return Err(ExecError::Busy),
-        };
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(ExecError::Failed("executor shutting down".into()));
+        }
+        let request_start = Instant::now();
+        let budget = execution_budget(&self.cfg, timeout_ms)?;
+        let deadline = Deadline::from_now(budget)?;
+        let mut cancellation = CancellationGuard::new(deadline.clone());
+        let permit = self.limiter.acquire(&deadline).await?;
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(ExecError::Failed("executor shutting down".into()));
+        }
         let cfg = self.cfg.clone();
         let target_lang = lang.unwrap_or_else(|| {
             self.cfg
@@ -525,16 +870,47 @@ impl FirecrackerExecutor {
                 .expect("default language must resolve")
         });
         let (tx, rx) = oneshot::channel();
+        let worker_deadline = deadline.clone();
+        let active_jobs = self.active_jobs.clone();
+        let shutting_down = self.shutting_down.clone();
         tokio::task::spawn_blocking(move || {
-            let result = run_sync(&cfg, &source, timeout_ms, target_lang, tx);
+            let result = run_sync(
+                &cfg,
+                &source,
+                timeout_ms,
+                target_lang,
+                request_start,
+                worker_deadline,
+                tx,
+                &active_jobs,
+                &shutting_down,
+            );
             drop(permit);
             if let Err(e) = &result {
                 warn!(error = %e, "job failed after verdict channel closed");
             }
         });
-        rx.await
-            .map_err(|_| ExecError::Failed("job task dropped before verdict".into()))?
+        let result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline.at), rx)
+            .await
+            .map_err(|_| ExecError::ExecutionDeadline)?
+            .map_err(|_| ExecError::Failed("job task dropped before verdict".into()))?;
+        cancellation.disarm();
+        result
     }
+}
+
+fn execution_budget(cfg: &ExecutorConfig, timeout_ms: u64) -> Result<Duration, ExecError> {
+    [
+        cfg.queue_timeout,
+        cfg.compile_timeout,
+        Duration::from_millis(timeout_ms),
+        BOOT_WAIT,
+        POWEROFF_GRACE,
+    ]
+    .into_iter()
+    .try_fold(Duration::ZERO, |total, part| {
+        total.checked_add(part).ok_or(ExecError::ExecutionDeadline)
+    })
 }
 
 struct JobLayout {
@@ -549,54 +925,273 @@ struct JobLayout {
 struct SnapPaths {
     state: PathBuf,
     mem: PathBuf,
+    manifest: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SnapshotManifest {
+    version: String,
+    fingerprint: String,
+    state_size: u64,
+    mem_size: u64,
+    state_sha256: String,
+    mem_sha256: String,
 }
 
 impl SnapPaths {
     fn ready(&self) -> bool {
-        self.state.is_file() && self.mem.is_file()
+        self.read_manifest()
+            .map(|manifest| self.matches_manifest(&manifest))
+            .unwrap_or(false)
     }
+
+    /// Check the durable publication marker and verify the snapshot contents.
+    ///
+    /// This runs while the caller holds the shared snapshot lock. The files
+    /// are published atomically, so hashing them here prevents a same-size
+    /// modification from being accepted as a valid restore image.
+    fn published(&self) -> bool {
+        let Some(manifest) = self.read_manifest() else {
+            return false;
+        };
+        if manifest.version != SNAPSHOT_FINGERPRINT_VERSION
+            || manifest.fingerprint.is_empty()
+            || !valid_snapshot_digest(&manifest.state_sha256)
+            || !valid_snapshot_digest(&manifest.mem_sha256)
+        {
+            return false;
+        }
+        self.matches_manifest(&manifest)
+    }
+
+    fn matches_fingerprint(&self, fingerprint: &str) -> bool {
+        self.read_manifest()
+            .map(|manifest| manifest.fingerprint == fingerprint && self.matches_manifest(&manifest))
+            .unwrap_or(false)
+    }
+
+    fn read_manifest(&self) -> Option<SnapshotManifest> {
+        let text = fs::read_to_string(&self.manifest).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    fn matches_manifest(&self, manifest: &SnapshotManifest) -> bool {
+        if manifest.version != SNAPSHOT_FINGERPRINT_VERSION {
+            return false;
+        }
+        let state = snapshot_file_info(&self.state).ok();
+        let mem = snapshot_file_info(&self.mem).ok();
+        match (state, mem) {
+            (Some(state), Some(mem)) => {
+                state.size == manifest.state_size
+                    && mem.size == manifest.mem_size
+                    && state.sha256 == manifest.state_sha256
+                    && mem.sha256 == manifest.mem_sha256
+            }
+            _ => false,
+        }
+    }
+}
+
+fn valid_snapshot_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn snap_paths(cfg: &ExecutorConfig) -> SnapPaths {
     SnapPaths {
         state: cfg.snapshot_dir.join("vm.snap"),
         mem: cfg.snapshot_dir.join("vm.mem"),
+        manifest: cfg.snapshot_dir.join("vm.manifest.json"),
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotFileInfo {
+    size: u64,
+    sha256: String,
+}
+
+fn snapshot_file_info(path: &Path) -> Result<SnapshotFileInfo, ExecError> {
+    let before = fs::metadata(path).map_err(io_err)?;
+    if !before.is_file() || before.len() == 0 {
+        return Err(ExecError::Failed(format!(
+            "snapshot file {} is missing or empty",
+            path.display()
+        )));
+    }
+    let digest = image_hash::sha256_file(path).map_err(|error| {
+        ExecError::Failed(format!("hash snapshot file {}: {error}", path.display()))
+    })?;
+    let after = fs::metadata(path).map_err(io_err)?;
+    if before.len() != after.len() {
+        return Err(ExecError::Failed(format!(
+            "snapshot file {} changed while hashing",
+            path.display()
+        )));
+    }
+    Ok(SnapshotFileInfo {
+        size: after.len(),
+        sha256: format_digest(digest),
+    })
+}
+
+struct SnapshotLock {
+    file: fs::File,
+}
+
+impl Drop for SnapshotLock {
+    fn drop(&mut self) {
+        // The descriptor is closed immediately afterwards as well; explicitly
+        // unlocking keeps the ownership boundary clear and portable across
+        // fork/exec details.
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+fn acquire_snapshot_lock(cfg: &ExecutorConfig) -> Result<SnapshotLock, ExecError> {
+    acquire_snapshot_lock_with_mode(cfg, libc::LOCK_EX, SNAP_LOCK_WAIT)
+}
+
+fn acquire_snapshot_shared_lock(cfg: &ExecutorConfig) -> Result<SnapshotLock, ExecError> {
+    acquire_snapshot_lock_with_mode(cfg, libc::LOCK_SH, SNAP_READ_LOCK_WAIT)
+}
+
+fn acquire_snapshot_lock_with_mode(
+    cfg: &ExecutorConfig,
+    lock_mode: libc::c_int,
+    wait: Duration,
+) -> Result<SnapshotLock, ExecError> {
+    fs::create_dir_all(&cfg.snapshot_dir).map_err(io_err)?;
+    let path = cfg.snapshot_dir.join(".snapshot.lock");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(io_err)?;
+    let deadline = Instant::now() + wait;
+    loop {
+        let rc = unsafe { libc::flock(file.as_raw_fd(), lock_mode | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(SnapshotLock { file });
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EWOULDBLOCK)
+            && error.raw_os_error() != Some(libc::EAGAIN)
+        {
+            return Err(io_err(error));
+        }
+        if Instant::now() >= deadline {
+            return Err(ExecError::Failed(format!(
+                "timed out waiting for snapshot lock {}",
+                path.display()
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn snapshot_fingerprint(cfg: &ExecutorConfig) -> Result<String, ExecError> {
+    let firecracker = image_hash::sha256_file(&cfg.firecracker)
+        .map_err(|error| ExecError::Failed(format!("snapshot Firecracker fingerprint: {error}")))?;
+    let kernel = image_hash::sha256_file(&cfg.kernel)
+        .map_err(|error| ExecError::Failed(format!("snapshot kernel fingerprint: {error}")))?;
+    let rootfs = image_hash::sha256_file(&cfg.rootfs)
+        .map_err(|error| ExecError::Failed(format!("snapshot rootfs fingerprint: {error}")))?;
+    Ok(format!(
+        "{SNAPSHOT_FINGERPRINT_VERSION}\nfirecracker={}\nkernel={}\nrootfs={}\nvcpu={}\nmem_mib={}\n",
+        format_digest(firecracker),
+        format_digest(kernel),
+        format_digest(rootfs),
+        cfg.vcpu,
+        cfg.mem_mib,
+    ))
+}
+
+fn format_digest(digest: [u8; 32]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_sync(
     cfg: &ExecutorConfig,
     source: &str,
     timeout_ms: u64,
     lang: ResolvedLanguage,
+    wall_start: Instant,
+    deadline: Deadline,
     tx: oneshot::Sender<Result<JobOutcome, ExecError>>,
+    active_jobs: &ActiveJobs,
+    shutting_down: &AtomicBool,
 ) -> Result<JobOutcome, ExecError> {
-    let wall_start = Instant::now();
     let t_copy = Instant::now();
-    let layout = match prepare_job(cfg) {
+    // Hold a shared lock through manifest validation and snapshot hardlinks so
+    // an exclusive publisher cannot replace one file between those steps.
+    // The lock is released before the VM starts, allowing restores to run in
+    // parallel.
+    let snapshot_lock = if cfg.use_snapshot && cfg.use_jailer {
+        match acquire_snapshot_shared_lock(cfg) {
+            Ok(lock) => Some(lock),
+            Err(error) => {
+                warn!(error = %error, "snapshot lock unavailable; using cold boot");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let restore = snapshot_lock.is_some() && snap_paths(cfg).published();
+    let layout = match prepare_job(cfg, restore) {
         Ok(layout) => layout,
         Err(e) => {
             let _ = tx.send(Err(e.clone()));
             return Err(e);
         }
     };
+    drop(snapshot_lock);
     let copy_ms = t_copy.elapsed().as_millis() as u64;
-
-    let snap = snap_paths(cfg);
-    let restore = cfg.use_snapshot && cfg.use_jailer && snap.ready();
-    let wall = cfg.compile_timeout + Duration::from_millis(timeout_ms) + BOOT_WAIT + POWEROFF_GRACE;
+    if let Err(error) = deadline.remaining() {
+        cleanup(&layout.jail_root);
+        let _ = tx.send(Err(error.clone()));
+        return Err(error);
+    }
+    if shutting_down.load(Ordering::Acquire) {
+        let error = ExecError::Failed("executor shutting down".into());
+        cleanup(&layout.jail_root);
+        let _ = tx.send(Err(error.clone()));
+        return Err(error);
+    }
 
     let result = run_vm(
-        cfg, &layout, source, timeout_ms, wall, copy_ms, restore, wall_start, &lang, tx,
+        cfg,
+        &layout,
+        source,
+        timeout_ms,
+        copy_ms,
+        restore,
+        wall_start,
+        &deadline,
+        &lang,
+        Some(active_jobs),
+        Some(shutting_down),
     );
     cleanup(&layout.jail_root);
+    let _ = tx.send(result.clone());
     result
 }
 
-fn prepare_job(cfg: &ExecutorConfig) -> Result<JobLayout, ExecError> {
-    fs::create_dir_all(&cfg.work_dir).map_err(io_err)?;
-    let cid = NEXT_ID.fetch_add(1, Ordering::Relaxed).max(3);
-    let id = format!("job-{cid}");
+fn prepare_job(cfg: &ExecutorConfig, restore: bool) -> Result<JobLayout, ExecError> {
+    fs::create_dir_all(&cfg.work_dir).map_err(|error| {
+        ExecError::Failed(format!(
+            "create work directory {}: {error}",
+            cfg.work_dir.display()
+        ))
+    })?;
+    let cid = NEXT_CID.fetch_add(1, Ordering::Relaxed).max(3);
+    let id = host_job_id(cid);
 
     let jail_root = if cfg.use_jailer {
         cfg.work_dir.join("firecracker").join(&id).join("root")
@@ -606,7 +1201,10 @@ fn prepare_job(cfg: &ExecutorConfig) -> Result<JobLayout, ExecError> {
 
     let build = || -> Result<JobLayout, ExecError> {
         for dir in ["kernel", "disk", "config", "vsock", "snapshot"] {
-            fs::create_dir_all(jail_root.join(dir)).map_err(io_err)?;
+            let path = jail_root.join(dir);
+            fs::create_dir_all(&path).map_err(|error| {
+                ExecError::Failed(format!("create jail directory {}: {error}", path.display()))
+            })?;
         }
 
         let kernel_dst = jail_root.join("kernel/vmlinux.bin");
@@ -615,7 +1213,7 @@ fn prepare_job(cfg: &ExecutorConfig) -> Result<JobLayout, ExecError> {
         hardlink_or_copy(&cfg.rootfs, &rootfs_dst)?;
 
         let snap = snap_paths(cfg);
-        if cfg.use_snapshot && cfg.use_jailer && snap.ready() {
+        if restore {
             hardlink_or_copy(&snap.state, &jail_root.join("snapshot/vm.snap"))?;
             hardlink_or_copy(&snap.mem, &jail_root.join("snapshot/vm.mem"))?;
         }
@@ -636,6 +1234,25 @@ fn prepare_job(cfg: &ExecutorConfig) -> Result<JobLayout, ExecError> {
                     .into_owned(),
             )
         };
+
+        let host_vsock = jail_root.join("vsock/job.sock");
+        if uds_path.len() >= UNIX_SOCKET_PATH_MAX {
+            return Err(ExecError::Failed(format!(
+                "vsock socket path is too long ({} bytes; limit {})",
+                uds_path.len(),
+                UNIX_SOCKET_PATH_MAX - 1
+            )));
+        }
+        // With the jailer, Firecracker sees the short in-jail path above,
+        // while the coordinator connects through this host-side path.
+        let host_vsock_len = host_vsock.to_string_lossy().len();
+        if host_vsock_len >= UNIX_SOCKET_PATH_MAX {
+            return Err(ExecError::Failed(format!(
+                "host vsock socket path is too long ({} bytes; limit {})",
+                host_vsock_len,
+                UNIX_SOCKET_PATH_MAX - 1
+            )));
+        }
 
         let vm = vm_config_json(
             &kernel_path,
@@ -658,7 +1275,7 @@ fn prepare_job(cfg: &ExecutorConfig) -> Result<JobLayout, ExecError> {
 
         Ok(JobLayout {
             id,
-            host_vsock: jail_root.join("vsock/job.sock"),
+            host_vsock,
             host_api: jail_root.join("api.sock"),
             jail_root: jail_root.clone(),
             vm_json,
@@ -728,46 +1345,62 @@ fn run_vm(
     layout: &JobLayout,
     source: &str,
     timeout_ms: u64,
-    wall: Duration,
     copy_ms: u64,
     restore: bool,
     wall_start: Instant,
+    deadline: &Deadline,
     lang: &ResolvedLanguage,
-    tx: oneshot::Sender<Result<JobOutcome, ExecError>>,
+    active_jobs: Option<&ActiveJobs>,
+    shutting_down: Option<&AtomicBool>,
 ) -> Result<JobOutcome, ExecError> {
-    let mut child = match if restore {
+    let operation_deadline = deadline.with_reserve(POWEROFF_GRACE)?;
+    let mut child = if restore {
         spawn_vm(cfg, layout, SpawnMode::ApiOnly, false)
     } else {
         spawn_vm(cfg, layout, SpawnMode::ConfigNoApi, false)
-    } {
-        Ok(child) => child,
-        Err(e) => {
-            let _ = tx.send(Err(e.clone()));
-            return Err(e);
+    }?;
+    if let Some(active_jobs) = active_jobs {
+        if let Ok(mut jobs) = active_jobs.lock() {
+            jobs.insert(layout.id.clone(), child.id());
         }
-    };
+        if shutting_down.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            kill_job_resources(&layout.id, child.id());
+        }
+    }
     let boot_t0 = Instant::now();
     info!(job = %layout.id, cid = layout.cid, restore, language = %lang.key, "microVM started");
 
     let rpc = (|| {
-        if restore && let Err(e) = load_snapshot(cfg, layout) {
-            warn!(error = %e, "snapshot restore failed; killing VM");
+        if restore && let Err(e) = load_snapshot(cfg, layout, &operation_deadline) {
+            warn!(error = %e, "snapshot restore failed");
             return Err(e);
         }
-        let mut stream = wait_connect(
-            &layout.host_vsock,
-            BOOT_WAIT.min(wall.saturating_sub(boot_t0.elapsed())),
-        )?;
+        let boot_deadline = Deadline {
+            at: Instant::now()
+                .checked_add(operation_deadline.cap(BOOT_WAIT)?)
+                .ok_or(ExecError::ExecutionDeadline)?,
+            cancelled: operation_deadline.cancelled.clone(),
+        };
+        let mut stream = wait_connect(&layout.host_vsock, &boot_deadline, Some(&mut child))
+            .map_err(|error| {
+                if matches!(error, ExecError::ExecutionDeadline)
+                    && operation_deadline.remaining().is_ok()
+                {
+                    ExecError::BootTimeout
+                } else {
+                    error
+                }
+            })?;
         let boot_ms = boot_t0.elapsed().as_millis() as u64;
-        let job = send_job(
-            &mut stream,
-            source,
-            timeout_ms,
-            lang,
-            wall.saturating_sub(boot_t0.elapsed()),
-        )?;
+        let job = send_job(&mut stream, source, timeout_ms, lang, &operation_deadline)?;
         Ok((job, boot_ms))
     })();
+    if restore && rpc.is_err() {
+        // A restored guest that cannot complete its agent handshake is no
+        // longer trustworthy for reuse. Keep the large files for diagnosis,
+        // but remove the durable publication marker so the next job cold boots.
+        invalidate_snapshot(cfg);
+    }
     let (rpc, boot_ms) = match rpc {
         Ok((job, boot_ms)) => (Ok(job), boot_ms),
         Err(e) => (Err(e), boot_t0.elapsed().as_millis() as u64),
@@ -787,21 +1420,7 @@ fn run_vm(
             restored: restore,
             cgroup: cgroup.clone(),
         }),
-        Err(_) if wall_start.elapsed() >= wall => Ok(JobOutcome {
-            job: JobResponse {
-                timed_out: true,
-                compilation_success: true,
-                run_ms: wall_start.elapsed().as_micros() as u64,
-                ..Default::default()
-            },
-            job_id: layout.id.clone(),
-            language: lang.key.clone(),
-            copy_ms,
-            boot_ms,
-            wall_ms,
-            restored: restore,
-            cgroup: cgroup.clone(),
-        }),
+        Err(ExecError::ExecutionDeadline) => Err(ExecError::ExecutionDeadline),
         Err(_) if oom => Ok(JobOutcome {
             job: JobResponse {
                 oom: true,
@@ -819,10 +1438,13 @@ fn run_vm(
         }),
         Err(e) => Err(e),
     };
-    let _ = tx.send(mapped.clone());
-
     let reap_t0 = Instant::now();
-    reap_vm(layout, &mut child);
+    reap_vm(layout, &mut child, Some(deadline));
+    if let Some(active_jobs) = active_jobs
+        && let Ok(mut jobs) = active_jobs.lock()
+    {
+        jobs.remove(&layout.id);
+    }
     info!(
         job = %layout.id,
         reap_ms = reap_t0.elapsed().as_millis() as u64,
@@ -831,8 +1453,12 @@ fn run_vm(
     mapped
 }
 
-fn load_snapshot(cfg: &ExecutorConfig, layout: &JobLayout) -> Result<(), ExecError> {
-    wait_path(&layout.host_api, Duration::from_secs(5))?;
+fn load_snapshot(
+    cfg: &ExecutorConfig,
+    layout: &JobLayout,
+    deadline: &Deadline,
+) -> Result<(), ExecError> {
+    wait_path(&layout.host_api, deadline, Duration::from_secs(5))?;
     let (snap_path, mem_path) = if cfg.use_jailer {
         (
             "/snapshot/vm.snap".to_string(),
@@ -852,8 +1478,9 @@ fn load_snapshot(cfg: &ExecutorConfig, layout: &JobLayout) -> Result<(), ExecErr
                 .into_owned(),
         )
     };
-    fc_put(
+    fc_http_timeout(
         &layout.host_api,
+        "PUT",
         "/snapshot/load",
         &json!({
             "snapshot_path": snap_path,
@@ -863,14 +1490,20 @@ fn load_snapshot(cfg: &ExecutorConfig, layout: &JobLayout) -> Result<(), ExecErr
             },
             "resume_vm": true
         }),
+        deadline.cap(SNAP_WAIT)?,
+        Some(deadline),
     )?;
     Ok(())
 }
 
-fn create_golden_snapshot(cfg: &ExecutorConfig) -> Result<(), ExecError> {
+fn create_golden_snapshot(cfg: &ExecutorConfig, fingerprint: &str) -> Result<(), ExecError> {
     fs::create_dir_all(&cfg.snapshot_dir).map_err(io_err)?;
+    let snap = snap_paths(cfg);
+    // Invalidate the manifest before replacing either snapshot file. A crash
+    // during creation must force the next start to rebuild.
+    invalidate_snapshot(cfg);
     let t0 = Instant::now();
-    let layout = prepare_job(cfg)?;
+    let layout = prepare_job(cfg, false)?;
     let fc_log = layout.jail_root.join("config/fc.log");
     let _ = fs::write(&fc_log, b"");
     if cfg.use_jailer {
@@ -881,9 +1514,10 @@ fn create_golden_snapshot(cfg: &ExecutorConfig) -> Result<(), ExecError> {
     }
     let mut child = spawn_vm(cfg, &layout, SpawnMode::ConfigWithApi, true)?;
     let result = (|| {
-        wait_path(&layout.host_api, BOOT_WAIT)?;
+        let boot_deadline = Deadline::from_now(BOOT_WAIT)?;
+        wait_path(&layout.host_api, &boot_deadline, BOOT_WAIT)?;
         info!("snapshot vm api ready");
-        wait_connect_probe(&layout.host_vsock, BOOT_WAIT)?;
+        wait_connect_probe(&layout.host_vsock, &boot_deadline, &mut child)?;
         info!("snapshot vm agent listening");
         std::thread::sleep(Duration::from_millis(100));
         fc_patch(&layout.host_api, "/vm", &json!({ "state": "Paused" }))?;
@@ -918,20 +1552,18 @@ fn create_golden_snapshot(cfg: &ExecutorConfig) -> Result<(), ExecError> {
                 "mem_file_path": mem_path
             }),
             SNAP_CREATE_WAIT,
+            None,
         )?;
         info!("snapshot files written in jail");
         let src_state = layout.jail_root.join("snapshot/vm.snap");
         let src_mem = layout.jail_root.join("snapshot/vm.mem");
-        fs::copy(&src_state, snap_paths(cfg).state).map_err(io_err)?;
-        fs::copy(&src_mem, snap_paths(cfg).mem).map_err(io_err)?;
+        publish_snapshot_file(&src_state, &snap.state)?;
+        publish_snapshot_file(&src_mem, &snap.mem)?;
         chmod_snapshot_group(cfg)?;
+        publish_snapshot_manifest(&snap, fingerprint)?;
         Ok(())
     })();
-    reap_vm(&layout, &mut child);
-    let _ = Command::new("pkill")
-        .args(["-9", "-x", "firecracker"])
-        .status();
-    let _ = Command::new("pkill").args(["-9", "-x", "jailer"]).status();
+    reap_vm(&layout, &mut child, None);
     if let Err(e) = &result
         && let Ok(log) = fs::read_to_string(&fc_log)
     {
@@ -957,11 +1589,90 @@ fn create_golden_snapshot(cfg: &ExecutorConfig) -> Result<(), ExecError> {
             Ok(())
         }
         Err(e) => {
-            let _ = fs::remove_file(snap_paths(cfg).state);
-            let _ = fs::remove_file(snap_paths(cfg).mem);
+            // The publication marker was removed before rebuilding, so old
+            // files cannot be restored accidentally. Keep them available for
+            // diagnosis and for a future successful rebuild.
+            invalidate_snapshot(cfg);
             Err(e)
         }
     }
+}
+
+fn publish_snapshot_file(source: &Path, destination: &Path) -> Result<(), ExecError> {
+    let temporary = snapshot_temp_path(destination);
+    let _ = fs::remove_file(&temporary);
+    let result = (|| {
+        fs::copy(source, &temporary).map_err(io_err)?;
+        fs::File::open(&temporary)
+            .map_err(io_err)?
+            .sync_all()
+            .map_err(io_err)?;
+        fs::rename(&temporary, destination).map_err(io_err)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result?;
+    sync_snapshot_dir(destination.parent().unwrap_or_else(|| Path::new(".")))
+}
+
+fn publish_snapshot_manifest(snap: &SnapPaths, fingerprint: &str) -> Result<(), ExecError> {
+    let state = snapshot_file_info(&snap.state)?;
+    let mem = snapshot_file_info(&snap.mem)?;
+    let manifest = SnapshotManifest {
+        version: SNAPSHOT_FINGERPRINT_VERSION.into(),
+        fingerprint: fingerprint.into(),
+        state_size: state.size,
+        mem_size: mem.size,
+        state_sha256: state.sha256,
+        mem_sha256: mem.sha256,
+    };
+    let temporary = snapshot_temp_path(&snap.manifest);
+    let _ = fs::remove_file(&temporary);
+    let result = (|| {
+        let mut file = fs::File::create(&temporary).map_err(io_err)?;
+        let encoded = serde_json::to_vec(&manifest)
+            .map_err(|error| ExecError::Failed(format!("serialize snapshot manifest: {error}")))?;
+        file.write_all(&encoded).map_err(io_err)?;
+        file.sync_all().map_err(io_err)?;
+        fs::rename(&temporary, &snap.manifest).map_err(io_err)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result?;
+    sync_snapshot_dir(snap.manifest.parent().unwrap_or_else(|| Path::new(".")))
+}
+
+fn sync_snapshot_dir(directory: &Path) -> Result<(), ExecError> {
+    fs::File::open(directory)
+        .map_err(io_err)?
+        .sync_all()
+        .map_err(io_err)
+}
+
+fn invalidate_snapshot(cfg: &ExecutorConfig) {
+    invalidate_snapshot_manifest(&cfg.snapshot_dir, &snap_paths(cfg).manifest);
+}
+
+fn invalidate_snapshot_manifest(directory: &Path, manifest: &Path) {
+    let removed = fs::remove_file(manifest);
+    if removed.is_ok()
+        || removed
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+    {
+        let _ = sync_snapshot_dir(directory);
+    }
+}
+
+fn snapshot_temp_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("snapshot");
+    path.with_file_name(format!(".{name}.tmp-{}", std::process::id()))
 }
 
 #[derive(Clone, Copy)]
@@ -1012,8 +1723,6 @@ fn spawn_vm(
             &format!("cpu.max={}", cfg.jail_cpu_max),
             "--cgroup",
             &format!("pids.max={}", cfg.jail_pids_max),
-            "--seccomp-level",
-            "2",
             "--new-pid-ns",
             "--",
         ]);
@@ -1053,12 +1762,22 @@ fn spawn_vm(
         }
         c
     };
+    cmd.process_group(0);
     cmd.env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(io_err)
+        .map_err(|error| {
+            ExecError::Failed(format!(
+                "spawn {}: {error}",
+                if cfg.use_jailer {
+                    cfg.jailer.display()
+                } else {
+                    cfg.firecracker.display()
+                }
+            ))
+        })
 }
 
 const CGROUP_BASES: &[&str] = &[
@@ -1102,37 +1821,49 @@ fn read_cgroup_stats(job_id: &str) -> CgroupStats {
     CgroupStats::default()
 }
 
-fn reap_vm(layout: &JobLayout, child: &mut Child) {
-    let _ = child.kill();
-
+fn kill_job_resources(job_id: &str, child_pid: u32) {
+    if let Ok(process_group) = i32::try_from(child_pid) {
+        // SAFETY: every registered child was placed into its own process group.
+        unsafe {
+            libc::kill(-process_group, libc::SIGKILL);
+        }
+    }
     for base in CGROUP_BASES {
-        let kill_path = format!("{base}/{}/cgroup.kill", layout.id);
+        let kill_path = format!("{base}/{job_id}/cgroup.kill");
         let p = Path::new(&kill_path);
         if p.is_file() {
             let _ = fs::write(p, b"1\n");
         }
     }
+}
 
-    let pattern = format!("--id {}\\b", layout.id);
-    let _ = Command::new("pkill")
-        .args(["-9", "-f", "--", &pattern])
-        .status();
+fn reap_vm(layout: &JobLayout, child: &mut Child, deadline: Option<&Deadline>) {
+    let child_pid = child.id();
+    let _ = child.kill();
+    kill_job_resources(&layout.id, child_pid);
 
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
+    let reap_limit = Instant::now() + Duration::from_secs(2);
+    let reap_deadline = deadline.map_or(reap_limit, |deadline| deadline.at.min(reap_limit));
+    while Instant::now() < reap_deadline {
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
             Err(_) => break,
         }
     }
+    // SIGKILL is not expected to take this long for a Firecracker process, but
+    // always reap the exact child before removing its cgroup and jail. This
+    // prevents a late exit from becoming a coordinator-owned zombie.
+    let _ = child.wait();
 
     for base in CGROUP_BASES {
         let dir_path = format!("{base}/{}", layout.id);
         let p = Path::new(&dir_path);
         if p.is_dir() {
-            let deadline = Instant::now() + Duration::from_millis(500);
-            while Instant::now() < deadline {
+            let cgroup_limit = Instant::now() + Duration::from_millis(500);
+            let cgroup_deadline =
+                deadline.map_or(cgroup_limit, |deadline| deadline.at.min(cgroup_limit));
+            while Instant::now() < cgroup_deadline {
                 if fs::remove_dir(p).is_ok() || !p.exists() {
                     break;
                 }
@@ -1147,7 +1878,7 @@ fn send_job(
     source: &str,
     timeout_ms: u64,
     lang: &ResolvedLanguage,
-    remaining: Duration,
+    deadline: &Deadline,
 ) -> Result<JobResponse, ExecError> {
     let bytes = serde_json::to_vec(&JobRequest {
         source: source.to_string(),
@@ -1157,68 +1888,87 @@ fn send_job(
         run_cmd: Some(lang.run_cmd.clone()),
     })
     .map_err(|e| ExecError::Failed(e.to_string()))?;
-    write_frame(stream, &bytes).map_err(io_err)?;
+    let remaining = deadline.remaining()?;
+    stream.set_write_timeout(Some(remaining)).map_err(io_err)?;
+    write_frame(stream, &bytes).map_err(|error| {
+        deadline
+            .remaining()
+            .map_or(ExecError::ExecutionDeadline, |_| io_err(error))
+    })?;
     stream
-        .set_read_timeout(Some(remaining.max(Duration::from_secs(1))))
+        .set_read_timeout(Some(deadline.remaining()?))
         .map_err(io_err)?;
-    let resp_bytes = read_frame(stream).map_err(io_err)?;
+    let resp_bytes = read_frame(stream).map_err(|error| {
+        deadline
+            .remaining()
+            .map_or(ExecError::ExecutionDeadline, |_| io_err(error))
+    })?;
     serde_json::from_slice(&resp_bytes).map_err(|e| ExecError::Failed(e.to_string()))
 }
 
-fn wait_connect(uds: &Path, timeout: Duration) -> Result<UnixStream, ExecError> {
-    let start = Instant::now();
-    let mut last = String::new();
-    while start.elapsed() < timeout {
-        match UnixStream::connect(uds) {
-            Ok(mut stream) => {
-                let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
-                let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
-                if stream.write_all(b"CONNECT 52\n").is_err() {
-                    std::thread::sleep(Duration::from_millis(50));
-                    continue;
+fn wait_connect(
+    uds: &Path,
+    deadline: &Deadline,
+    mut child: Option<&mut Child>,
+) -> Result<UnixStream, ExecError> {
+    loop {
+        if let Some(child) = child.as_deref_mut() {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    return Err(ExecError::Failed(format!(
+                        "firecracker exited before vsock became ready: {status}"
+                    )));
                 }
-                match read_line_bytes(&mut stream) {
-                    Ok(line) if line.starts_with("OK") => {
-                        let _ = stream.set_read_timeout(None);
-                        let _ = stream.set_write_timeout(None);
-                        return Ok(stream);
-                    }
-                    Ok(line) => last = format!("vsock handshake: {line}"),
-                    Err(e) => last = e.to_string(),
-                }
+                Ok(None) => {}
+                Err(error) => return Err(io_err(error)),
             }
-            Err(e) => last = e.to_string(),
         }
-        std::thread::sleep(Duration::from_millis(50));
+        let attempt_timeout = deadline.cap(Duration::from_millis(200))?;
+        if let Ok(mut stream) = UnixStream::connect(uds) {
+            let _ = stream.set_read_timeout(Some(attempt_timeout));
+            let _ = stream.set_write_timeout(Some(attempt_timeout));
+            if stream.write_all(b"CONNECT 52\n").is_err() {
+                std::thread::sleep(deadline.cap(Duration::from_millis(50))?);
+                continue;
+            }
+            match read_line_bytes(&mut stream) {
+                Ok(line) if line.starts_with("OK") => {
+                    let _ = stream.set_read_timeout(None);
+                    let _ = stream.set_write_timeout(None);
+                    return Ok(stream);
+                }
+                Ok(_) | Err(_) => {}
+            }
+        }
+        std::thread::sleep(deadline.cap(Duration::from_millis(50))?);
     }
-    Err(ExecError::Failed(format!("agent vsock not ready: {last}")))
 }
 
-fn wait_connect_probe(uds: &Path, timeout: Duration) -> Result<(), ExecError> {
-    let _stream = wait_connect(uds, timeout)?;
+fn wait_connect_probe(uds: &Path, deadline: &Deadline, child: &mut Child) -> Result<(), ExecError> {
+    let _stream = wait_connect(uds, deadline, Some(child))?;
     Ok(())
 }
 
-fn wait_path(path: &Path, timeout: Duration) -> Result<(), ExecError> {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
+fn wait_path(path: &Path, deadline: &Deadline, phase_limit: Duration) -> Result<(), ExecError> {
+    let phase_deadline = Instant::now()
+        .checked_add(deadline.cap(phase_limit)?)
+        .ok_or(ExecError::ExecutionDeadline)?;
+    loop {
         if path.exists() {
             return Ok(());
         }
-        std::thread::sleep(Duration::from_millis(20));
+        if Instant::now() >= phase_deadline {
+            return Err(ExecError::Failed(format!(
+                "timed out waiting for {}",
+                path.display()
+            )));
+        }
+        std::thread::sleep(deadline.cap(Duration::from_millis(20))?);
     }
-    Err(ExecError::Failed(format!(
-        "timed out waiting for {}",
-        path.display()
-    )))
 }
 
 fn fc_patch(sock: &Path, url_path: &str, body: &serde_json::Value) -> Result<(), ExecError> {
-    fc_http_timeout(sock, "PATCH", url_path, body, SNAP_WAIT)
-}
-
-fn fc_put(sock: &Path, url_path: &str, body: &serde_json::Value) -> Result<(), ExecError> {
-    fc_http_timeout(sock, "PUT", url_path, body, SNAP_WAIT)
+    fc_http_timeout(sock, "PATCH", url_path, body, SNAP_WAIT, None)
 }
 
 fn fc_http_timeout(
@@ -1227,23 +1977,50 @@ fn fc_http_timeout(
     url_path: &str,
     body: &serde_json::Value,
     read_timeout: Duration,
+    deadline: Option<&Deadline>,
 ) -> Result<(), ExecError> {
     let payload = serde_json::to_vec(body).map_err(|e| ExecError::Failed(e.to_string()))?;
     let mut stream = UnixStream::connect(sock).map_err(io_err)?;
-    stream
-        .set_read_timeout(Some(read_timeout))
-        .map_err(io_err)?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(10)))
-        .map_err(io_err)?;
     let req = format!(
         "{method} {url_path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         payload.len()
     );
-    stream.write_all(req.as_bytes()).map_err(io_err)?;
-    stream.write_all(&payload).map_err(io_err)?;
+    let mut request = req.into_bytes();
+    request.extend_from_slice(&payload);
+    let write_timeout = deadline
+        .map(|deadline| deadline.cap(Duration::from_secs(10)))
+        .transpose()?
+        .unwrap_or_else(|| read_timeout.min(Duration::from_secs(10)));
+    stream
+        .set_write_timeout(Some(write_timeout))
+        .map_err(io_err)?;
+    stream.write_all(&request).map_err(|error| {
+        if deadline.is_some_and(|deadline| deadline.remaining().is_err()) {
+            ExecError::ExecutionDeadline
+        } else {
+            io_err(error)
+        }
+    })?;
+    if let Some(deadline) = deadline {
+        stream
+            .set_write_timeout(Some(deadline.remaining()?))
+            .map_err(io_err)?;
+    }
     stream.flush().map_err(io_err)?;
-    let text = read_http_response(&mut stream)?;
+    let effective_read_timeout = deadline
+        .map(|deadline| deadline.cap(read_timeout))
+        .transpose()?
+        .unwrap_or(read_timeout);
+    stream
+        .set_read_timeout(Some(effective_read_timeout))
+        .map_err(io_err)?;
+    let text = read_http_response(&mut stream).map_err(|error| {
+        if deadline.is_some_and(|deadline| deadline.remaining().is_err()) {
+            ExecError::ExecutionDeadline
+        } else {
+            error
+        }
+    })?;
     let status = text
         .lines()
         .next()
@@ -1312,11 +2089,20 @@ fn chmod_snapshot_group(cfg: &ExecutorConfig) -> Result<(), ExecError> {
 }
 
 fn hardlink_or_copy(src: &Path, dst: &Path) -> Result<(), ExecError> {
+    let source = fs::canonicalize(src).map_err(|error| {
+        ExecError::Failed(format!("resolve runtime asset {}: {error}", src.display()))
+    })?;
     let _ = fs::remove_file(dst);
-    if fs::hard_link(src, dst).is_ok() {
+    if fs::hard_link(&source, dst).is_ok() {
         return Ok(());
     }
-    fs::copy(src, dst).map_err(io_err)?;
+    fs::copy(&source, dst).map_err(|error| {
+        ExecError::Failed(format!(
+            "copy runtime asset {} to {}: {error}",
+            source.display(),
+            dst.display()
+        ))
+    })?;
     Ok(())
 }
 
@@ -1342,9 +2128,189 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::thread;
 
+    fn valid_resource_config<'a>(
+        jail_mem_max: &'a str,
+        jail_cpu_max: &'a str,
+    ) -> ResourceConfig<'a> {
+        ResourceConfig {
+            vcpu: 2,
+            mem_mib: 2048,
+            jail_mem_max,
+            jail_cpu_max,
+            jail_pids_max: 64,
+            max_concurrent_jobs: 1,
+            max_queued_jobs: 64,
+            queue_timeout_ms: 10_000,
+            compile_timeout_secs: 12,
+        }
+    }
+
+    #[test]
+    fn resource_config_accepts_defaults() {
+        assert!(
+            validate_resource_config(&valid_resource_config(JAIL_MEMORY_MAX, "200000 100000"))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn resource_config_rejects_invalid_vm_sizes() {
+        let mut config = valid_resource_config(JAIL_MEMORY_MAX, "200000 100000");
+        config.vcpu = 0;
+        assert!(
+            validate_resource_config(&config)
+                .unwrap_err()
+                .contains("CRATERA_VCPU")
+        );
+
+        config.vcpu = 2;
+        config.mem_mib = 64;
+        assert!(
+            validate_resource_config(&config)
+                .unwrap_err()
+                .contains("CRATERA_MEM_MIB")
+        );
+    }
+
+    #[test]
+    fn resource_config_rejects_cgroup_memory_below_guest_memory() {
+        let config = valid_resource_config("1073741824", "200000 100000");
+        assert!(
+            validate_resource_config(&config)
+                .unwrap_err()
+                .contains("CRATERA_JAIL_MEM_MAX")
+        );
+    }
+
+    #[test]
+    fn cpu_max_validation_accepts_linux_format_and_rejects_bad_values() {
+        assert!(validate_cpu_max("200000 100000").is_ok());
+        assert!(validate_cpu_max("max 100000").is_ok());
+        assert!(validate_cpu_max("0 100000").is_err());
+        assert!(validate_cpu_max("200000").is_err());
+        assert!(validate_cpu_max("200000 999").is_err());
+        assert!(validate_cpu_max("200000 100000 extra").is_err());
+    }
+
+    #[test]
+    fn deadline_caps_phases_and_observes_cancellation() {
+        let deadline = Deadline::from_now(Duration::from_secs(1)).unwrap();
+        assert!(deadline.cap(Duration::from_millis(10)).unwrap() <= Duration::from_millis(10));
+        deadline.cancel();
+        assert!(matches!(
+            deadline.remaining(),
+            Err(ExecError::ExecutionDeadline)
+        ));
+    }
+
+    #[test]
+    fn expired_deadline_fails_immediately() {
+        let deadline = Deadline::from_now(Duration::ZERO).unwrap();
+        assert!(matches!(
+            deadline.remaining(),
+            Err(ExecError::ExecutionDeadline)
+        ));
+    }
+
+    #[tokio::test]
+    async fn execution_limiter_runs_up_to_configured_capacity() {
+        let limiter = ExecutionLimiter::new(2, 0, Duration::from_secs(1));
+        let deadline = Deadline::from_now(Duration::from_secs(1)).unwrap();
+        let first = limiter.acquire(&deadline).await.unwrap();
+        let second = limiter.acquire(&deadline).await.unwrap();
+
+        assert!(matches!(
+            limiter.acquire(&deadline).await,
+            Err(ExecError::QueueFull)
+        ));
+
+        drop(first);
+        drop(second);
+        assert!(limiter.acquire(&deadline).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn execution_limiter_bounds_the_waiting_queue() {
+        let limiter = ExecutionLimiter::new(1, 1, Duration::from_secs(1));
+        let deadline = Deadline::from_now(Duration::from_secs(1)).unwrap();
+        let running = limiter.acquire(&deadline).await.unwrap();
+        let queued_limiter = limiter.clone();
+        let queued_deadline = deadline.clone();
+        let queued = tokio::spawn(async move { queued_limiter.acquire(&queued_deadline).await });
+        tokio::task::yield_now().await;
+
+        assert!(matches!(
+            limiter.acquire(&deadline).await,
+            Err(ExecError::QueueFull)
+        ));
+
+        drop(running);
+        assert!(queued.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn execution_limiter_times_out_queued_work() {
+        let limiter = ExecutionLimiter::new(1, 1, Duration::from_millis(1));
+        let deadline = Deadline::from_now(Duration::from_secs(1)).unwrap();
+        let _running = limiter.acquire(&deadline).await.unwrap();
+
+        assert!(matches!(
+            limiter.acquire(&deadline).await,
+            Err(ExecError::Busy)
+        ));
+        assert!(matches!(
+            limiter.acquire(&deadline).await,
+            Err(ExecError::Busy)
+        ));
+    }
+
+    #[tokio::test]
+    async fn execution_limiter_reclaims_cancelled_queue_admission() {
+        let limiter = ExecutionLimiter::new(1, 1, Duration::from_millis(1));
+        let deadline = Deadline::from_now(Duration::from_secs(1)).unwrap();
+        let _running = limiter.acquire(&deadline).await.unwrap();
+        let queued_limiter = limiter.clone();
+        let queued_deadline = deadline.clone();
+        let queued = tokio::spawn(async move { queued_limiter.acquire(&queued_deadline).await });
+        tokio::task::yield_now().await;
+        queued.abort();
+        let _ = queued.await;
+
+        assert!(matches!(
+            limiter.acquire(&deadline).await,
+            Err(ExecError::Busy)
+        ));
+    }
+
+    #[tokio::test]
+    async fn execution_limiter_shutdown_wakes_queued_work_immediately() {
+        let limiter = ExecutionLimiter::new(1, 1, Duration::from_secs(60));
+        let deadline = Deadline::from_now(Duration::from_secs(60)).unwrap();
+        let _running = limiter.acquire(&deadline).await.unwrap();
+        let queued_limiter = limiter.clone();
+        let queued_deadline = deadline.clone();
+        let queued = tokio::spawn(async move { queued_limiter.acquire(&queued_deadline).await });
+        tokio::task::yield_now().await;
+
+        limiter.shutdown();
+
+        let result = tokio::time::timeout(Duration::from_millis(100), queued)
+            .await
+            .expect("shutdown must wake queued work promptly")
+            .unwrap();
+        assert!(matches!(result, Err(ExecError::Failed(message)) if message == "executor closed"));
+    }
+
     #[test]
     fn http_204_does_not_wait_for_peer_close() {
-        let path = std::env::temp_dir().join(format!("grade-fc-http-{}.sock", std::process::id()));
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "cratera-fc-http-{}-{unique}.sock",
+            std::process::id()
+        ));
         let _ = fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
         let server = thread::spawn(move || {
@@ -1363,13 +2329,14 @@ mod tests {
         client.flush().unwrap();
         let started = Instant::now();
         let text = read_http_response(&mut client).unwrap();
-        let _ = fs::remove_file(&path);
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "must not wait for the peer to close"
         );
         assert!(text.contains("204"));
-        drop(server);
+        drop(client);
+        server.join().unwrap();
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
@@ -1377,6 +2344,105 @@ mod tests {
         let raw = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 5\r\n\r\nbad!!";
         let text = read_http_response(&mut Cursor::new(&raw[..])).unwrap();
         assert!(text.ends_with("bad!!"));
+    }
+
+    #[test]
+    fn hardlink_or_copy_dereferences_symlink_sources() {
+        use std::os::unix::fs::symlink;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("cratera-hardlink-{}-{unique}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let source = dir.join("rootfs.squashfs");
+        let link = dir.join("rootfs.ext4");
+        let destination = dir.join("jail-rootfs.ext4");
+        fs::write(&source, b"rootfs").unwrap();
+        symlink("rootfs.squashfs", &link).unwrap();
+
+        hardlink_or_copy(&link, &destination).unwrap();
+
+        assert!(!fs::symlink_metadata(&destination).unwrap().is_symlink());
+        assert_eq!(fs::read(&destination).unwrap(), b"rootfs");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn snapshot_manifest_rejects_mismatch_and_truncation() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "cratera-snapshot-ready-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let snap = SnapPaths {
+            state: dir.join("vm.snap"),
+            mem: dir.join("vm.mem"),
+            manifest: dir.join("vm.manifest.json"),
+        };
+
+        fs::write(&snap.state, b"state").unwrap();
+        fs::write(&snap.mem, b"memory").unwrap();
+        assert!(!snap.ready());
+
+        let state = snapshot_file_info(&snap.state).unwrap();
+        let mem = snapshot_file_info(&snap.mem).unwrap();
+        let manifest = SnapshotManifest {
+            version: SNAPSHOT_FINGERPRINT_VERSION.into(),
+            fingerprint: "fingerprint\n".into(),
+            state_size: state.size,
+            mem_size: mem.size,
+            state_sha256: state.sha256,
+            mem_sha256: mem.sha256,
+        };
+        fs::write(&snap.manifest, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(snap.ready());
+        assert!(snap.published());
+        assert!(snap.matches_fingerprint("fingerprint\n"));
+        assert!(!snap.matches_fingerprint("stale\n"));
+
+        fs::write(&snap.mem, b"truncated").unwrap();
+        assert!(!snap.ready());
+        assert!(!snap.published());
+
+        // A same-size mutation must not bypass restore validation.
+        fs::write(&snap.mem, b"memory").unwrap();
+        assert!(snap.published());
+        fs::write(&snap.mem, b"MEMORY").unwrap();
+        assert!(!snap.published());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn snapshot_invalidation_removes_only_manifest() {
+        let dir = std::env::temp_dir().join(format!(
+            "cratera-snapshot-invalidate-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let state = dir.join("vm.snap");
+        let mem = dir.join("vm.mem");
+        let manifest = dir.join("vm.manifest.json");
+        fs::write(&state, b"state").unwrap();
+        fs::write(&mem, b"memory").unwrap();
+        fs::write(&manifest, b"manifest").unwrap();
+
+        invalidate_snapshot_manifest(&dir, &manifest);
+
+        assert!(!manifest.exists());
+        assert!(state.exists());
+        assert!(mem.exists());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1499,5 +2565,25 @@ mod tests {
         assert_eq!(jail_cpu_max_value(2, None), "200000 100000");
         assert_eq!(jail_cpu_max_value(1, None), "100000 100000");
         assert_eq!(jail_cpu_max_value(2, Some("50000 100000")), "50000 100000");
+    }
+
+    #[test]
+    fn host_job_id_is_process_unique_and_keeps_numeric_cid_suffix() {
+        let id = host_job_id(3);
+        assert!(id.starts_with("job-"));
+        assert!(id.ends_with("-3"));
+        assert_ne!(id, "job-3");
+    }
+
+    #[test]
+    fn host_job_vsock_path_fits_github_actions_worktree() {
+        let path = Path::new("/home/runner/work/cratera/cratera/target/cratera-smoke.XXXXXX")
+            .join(host_job_id(3))
+            .join("vsock/job.sock");
+        assert!(
+            path.to_string_lossy().len() < UNIX_SOCKET_PATH_MAX,
+            "vsock path is too long: {} bytes",
+            path.to_string_lossy().len()
+        );
     }
 }

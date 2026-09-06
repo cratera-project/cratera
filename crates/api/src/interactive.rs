@@ -13,6 +13,7 @@ const RESET: &str = "\x1b[0m";
 pub async fn run_interactive() -> anyhow::Result<()> {
     loop {
         let server_active = server::is_server_running().await;
+        let local_server_active = server::get_server_pid().is_some();
         let server_addr = server::get_server_addr().await;
         let svc_active = service::is_service_active();
         let svc_installed = service::is_service_installed();
@@ -34,10 +35,14 @@ pub async fn run_interactive() -> anyhow::Result<()> {
             "  {BOLD}{BOLD}[5]{RESET} {BOLD}Build / Rebuild Guest Rootfs Image{RESET} {DIM}(SquashFS / ext4){RESET}"
         );
 
-        if server_active {
+        if local_server_active {
             println!(
                 "  {BOLD}{RED}[6]{RESET} {BOLD}Stop Interactive Local Server{RESET} {GREEN}[Active on {}]{RESET}",
                 server_addr
+            );
+        } else if server_active {
+            println!(
+                "  {BOLD}{YELLOW}[6]{RESET} {BOLD}Interactive Local Server{RESET} {DIM}[Port is owned by systemd or another process]{RESET}"
             );
         } else {
             println!(
@@ -81,13 +86,18 @@ pub async fn run_interactive() -> anyhow::Result<()> {
                 pause();
             }
             "6" => {
-                if server_active {
+                if local_server_active {
                     let stopped = server::stop_server().await;
                     if stopped {
                         println!("\n{BOLD}{YELLOW}✓ Stopped HTTP Coordinator Server.{RESET}");
                     } else {
                         println!("\n{DIM}Server was already stopped.{RESET}");
                     }
+                } else if server_active {
+                    println!(
+                        "\n{DIM}Port 3100 is already served by systemd or another process; no local server was started.{RESET}"
+                    );
+                    println!("  {DIM}Use [7] to manage the systemd service.{RESET}");
                 } else {
                     match server::start_server_background().await {
                         Ok(addr) => {
@@ -341,14 +351,18 @@ async fn handle_tester_menu() -> anyhow::Result<()> {
         let choice = prompt_input("Select an option [0-2] > ");
         match choice.trim() {
             "1" => {
-                let _ = tester::run_test(&["all".into()]).await;
+                if let Err(error) = tester::run_test(&["all".into()]).await {
+                    eprintln!("{RED}Smoke test failed:{RESET} {error}");
+                }
                 pause();
             }
             "2" => {
                 let lang =
                     prompt_input("Enter language to test (e.g. rust, python, node, cpp, go) > ");
-                if !lang.trim().is_empty() {
-                    let _ = tester::run_test(&[lang.trim().to_string()]).await;
+                if !lang.trim().is_empty()
+                    && let Err(error) = tester::run_test(&[lang.trim().to_string()]).await
+                {
+                    eprintln!("{RED}Smoke test failed:{RESET} {error}");
                 }
                 pause();
             }

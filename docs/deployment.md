@@ -15,26 +15,37 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/opt/cratera
+EnvironmentFile=-/opt/cratera/.env
+
+# Runtime configuration
 Environment=NODE_ENV=production
 Environment=CRATERA_BIND=127.0.0.1:3100
+
+# Firecracker binaries and guest assets
 Environment=CRATERA_FIRECRACKER=/usr/local/bin/firecracker
 Environment=CRATERA_JAILER=/usr/local/bin/jailer
 Environment=CRATERA_KERNEL=/opt/cratera/images/vmlinux.bin
 Environment=CRATERA_ROOTFS=/opt/cratera/images/rootfs.ext4
 Environment=CRATERA_WORK_DIR=/var/lib/cratera
+
+# Jailer and snapshot configuration
 Environment=CRATERA_USE_JAILER=1
 Environment=CRATERA_JAIL_UID=20001
 Environment=CRATERA_JAIL_GID=20001
 Environment=CRATERA_USE_SNAPSHOT=1
 Environment=CRATERA_SNAPSHOT_DIR=/opt/cratera/images/snapshot
-EnvironmentFile=-/opt/cratera/.env
-ExecStart=/opt/cratera/cratera
+
+ExecStart=/opt/cratera/cratera serve
+
+# Process lifecycle and resource limits
 Restart=on-failure
 RestartSec=3
+TimeoutStopSec=15s
 LimitNOFILE=65536
 Delegate=yes
 KillMode=mixed
 
+# Restrict service networking to localhost.
 IPAddressDeny=any
 IPAddressAllow=localhost
 
@@ -57,7 +68,8 @@ WantedBy=multi-user.target
 | **`[Service]`** | `EnvironmentFile` | `-/opt/cratera/.env` | Loads optional operator environment overrides. The leading `-` prevents service failure if `.env` is absent. |
 | **`[Service]`** | `Restart` | `on-failure` | Automatically resurrects the service if the coordinator process terminates unexpectedly. |
 | **`[Service]`** | `RestartSec` | `3` | Imposes a 3-second delay before restarting to prevent rapid restart loops during hardware faults. |
-| **`[Service]`** | `LimitNOFILE` | `65536` | Raises file descriptor limits to accommodate high-concurrency microVM execution (epoll pipes, vsock descriptors, disk handles). |
+| **`[Service]`** | `TimeoutStopSec` | `15s` | Gives graceful shutdown time to cancel and reap active VM jobs before systemd's `KillMode=mixed` fallback. |
+| **`[Service]`** | `LimitNOFILE` | `65536` | Raises file descriptor limits for configurable concurrent microVM execution (epoll pipes, vsock descriptors, disk handles). |
 | **`[Service]`** | `Delegate` | `yes` | **Critical for cgroups v2**: Grants Cratera authority over its own cgroup sub-hierarchy (`/sys/fs/cgroup/system.slice/cratera.service/...`) to enforce per-microVM CPU and memory budgets. |
 | **`[Service]`** | `KillMode` | `mixed` | Sends `SIGTERM` to the main coordinator process on stop/restart, then sends `SIGKILL` to any lingering microVM child processes. |
 | **`[Service]`** | `IPAddressDeny` | `any` | **Host-level eBPF Sandboxing**: Employs kernel eBPF cgroup network filters to drop all inbound and outbound IPv4/IPv6 packets. |
@@ -77,6 +89,30 @@ WantedBy=multi-user.target
 | **`[Install]`** | `WantedBy` | `multi-user.target` | Directs systemd to start Cratera automatically on system boot when enabled. |
 
 ---
+
+## Host `jailer` Account
+
+Running `scripts/host-setup.sh` provisions the host service identity named
+`jailer` with UID and GID `20001`. It has no home directory and uses
+`/usr/sbin/nologin`; it is a locked, non-interactive account intended only for
+the Firecracker Jailer.
+
+The coordinator starts Firecracker through Jailer, which drops the VM process
+to this UID/GID before applying the chroot and cgroup restrictions. Cratera
+also uses the numeric UID for VM file ownership and host firewall rules that
+block jailed processes from opening network connections. Keep UID/GID `20001`
+reserved for this purpose. Do not delete the account or assign either ID to a
+different user or group, or existing ownership and isolation rules can be
+weakened.
+
+`CRATERA_USE_JAILER=0` is suitable only for local development. It removes the
+Jailer privilege drop, chroot, and cgroup boundary, and snapshot restore is
+unavailable without Jailer. Production configuration rejects this setting.
+
+The account name is an implementation detail, but renaming it is not a
+supported routine customization: the host setup script currently expects the
+name `jailer`. If it must be renamed, retain UID/GID `20001` and update the
+setup and operational tooling together.
 
 ## Service Installation & Management
 
@@ -109,7 +145,7 @@ Fields:
 
 | Field | Meaning |
 | :--- | :--- |
-| `job_id` | Jailer/Firecracker id (`job-N`) |
+| `job_id` | Jailer/Firecracker id (`job-<process>-<timestamp>-<cid>`, unique across coordinator restarts) |
 | `language` | Resolved language key |
 | `verdict` | `AC`, `WA`, `TLE`, `MLE`, `RE`, `CE` |
 | `timed_out` / `oom` | Guest timeout or SIGKILL/OOM |

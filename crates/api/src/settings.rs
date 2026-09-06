@@ -44,6 +44,24 @@ pub const ALL_SETTINGS: &[SettingDef] = &[
         default_val: "12",
         category: "Timeouts & Execution Budgets",
     },
+    SettingDef {
+        key: "CRATERA_QUEUE_TIMEOUT_MS",
+        description: "Maximum submission queue wait (ms)",
+        default_val: "10000",
+        category: "Timeouts & Execution Budgets",
+    },
+    SettingDef {
+        key: "CRATERA_MAX_CONCURRENT_JOBS",
+        description: "Maximum simultaneously running microVM jobs",
+        default_val: "1",
+        category: "Submission Capacity",
+    },
+    SettingDef {
+        key: "CRATERA_MAX_QUEUED_JOBS",
+        description: "Maximum submissions waiting for an execution slot",
+        default_val: "64",
+        category: "Submission Capacity",
+    },
     // 2. MicroVM Hardware Budgets (Per VM)
     SettingDef {
         key: "CRATERA_VCPU",

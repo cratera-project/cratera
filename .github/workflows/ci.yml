@@ -126,7 +126,8 @@ jobs:
         if: steps.filter.outputs.vm_relevant == 'true'
         run: |
           sudo usermod -aG kvm $USER 2>/dev/null || true
-          sudo chmod 666 /dev/kvm 2>/dev/null || true
+          sudo chown root:kvm /dev/kvm 2>/dev/null || true
+          sudo chmod 660 /dev/kvm 2>/dev/null || true
           if [ -e /dev/kvm ]; then
             echo "KVM ready: /dev/kvm accessible"
           else
@@ -143,7 +144,7 @@ jobs:
 
       - name: Run In-Guest Smoke Test (Hardware MicroVM)
         if: steps.filter.outputs.vm_relevant == 'true'
-        run: ./scripts/smoke.sh minimal
+        run: sg kvm -c './scripts/smoke.sh minimal'
 
       - name: Skip notice (no microVM-relevant files changed)
         if: steps.filter.outputs.vm_relevant != 'true'
@@ -169,4 +170,3 @@ jobs:
 
       - name: Build release guest agent (musl static)
         run: cargo build --release -p cratera-guest-agent --target x86_64-unknown-linux-musl
-

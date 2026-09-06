@@ -5,8 +5,9 @@
 # All language runtimes, compilers, and packages are configured in languages.toml.
 #
 # Usage:
-#   ./scripts/install.sh              # Full interactive setup (press Enter for defaults)
-#   ./scripts/install.sh --yes        # Automated / unattended setup (installs all languages)
+#   ./scripts/install.sh              # Interactive setup (press Enter for minimal Rust)
+#   ./scripts/install.sh --yes        # Automated / unattended setup (minimal Rust)
+#   ./scripts/install.sh --yes --languages=all  # Explicitly install every language
 #   LANGUAGES="minimal" ./scripts/install.sh --yes
 #   ./scripts/install.sh --test       # Run in-guest smoke test only
 #   ./scripts/install.sh --start      # Start the Cratera coordinator
@@ -26,6 +27,24 @@ RESET="\033[0m"
 
 MODE="${1:-}"
 
+CLI_LANGUAGES=""
+for ((arg_index = 1; arg_index <= $#; arg_index++)); do
+  arg="${!arg_index}"
+  case "$arg" in
+    --languages=*|--preset=*)
+      CLI_LANGUAGES="${arg#*=}"
+      ;;
+    --languages|--preset)
+      value_index=$((arg_index + 1))
+      if (( value_index > $# )); then
+        echo "ERROR: $arg requires a preset or comma-separated language list." >&2
+        exit 2
+      fi
+      CLI_LANGUAGES="${!value_index}"
+      ;;
+  esac
+done
+
 # Fast path: run smoke test
 if [[ "$MODE" == "--test" || "$MODE" == "test" || "$MODE" == "smoke" ]]; then
   exec ./scripts/smoke.sh "${@:2}"
@@ -33,16 +52,25 @@ fi
 
 # Fast path: start server
 if [[ "$MODE" == "--start" || "$MODE" == "start" || "$MODE" == "run" ]]; then
-  exec cargo run --release --bin cratera
+  exec cargo run --release --bin cratera -- serve
 fi
 
 WANT_SERVICE=0
-if [[ "$MODE" == "--service" || "$MODE" == "-s" ]]; then
-  WANT_SERVICE=1
-fi
+for arg in "$@"; do
+  if [[ "$arg" == "--service" || "$arg" == "-s" ]]; then
+    WANT_SERVICE=1
+    break
+  fi
+done
 
 UNATTENDED=0
-if [[ "$MODE" == "--yes" || "$MODE" == "-y" || "${CI:-}" == "true" ]]; then
+for arg in "$@"; do
+  if [[ "$arg" == "--yes" || "$arg" == "-y" ]]; then
+    UNATTENDED=1
+    break
+  fi
+done
+if [[ "${CI:-}" == "true" ]]; then
   UNATTENDED=1
 fi
 
@@ -58,14 +86,20 @@ echo ""
 # -----------------------------------------------------------------------------
 echo -e "${BOLD}[1/7] Checking hardware & host prerequisites...${RESET}"
 
+OS="$(uname -s)"
 ARCH="$(uname -m)"
-if [[ "$ARCH" != "x86_64" ]]; then
-  echo -e "${YELLOW}  ! Warning: Host architecture is $ARCH (Firecracker prebuilts are x86_64).${RESET}"
+if [[ "$OS" != "Linux" ]]; then
+  echo -e "${RED}  ✗ Unsupported host OS: $OS. The KVM installer requires Linux.${RESET}" >&2
+  echo "    For local development and unit tests, run: cargo test --workspace" >&2
+  echo "    For microVM execution, use a Linux VM or WSL2 with nested KVM exposed." >&2
+  exit 1
 fi
 
-if [[ "$(uname -s)" != "Linux" ]]; then
-  echo -e "${YELLOW}  ! Warning: Non-Linux OS detected ($(uname -s)). Firecracker requires Linux KVM.${RESET}"
-  echo "    For macOS/Windows, ensure nested virtualization is enabled in your VM/WSL2."
+if [[ "$ARCH" != "x86_64" ]]; then
+  echo -e "${RED}  ✗ Unsupported host architecture: $ARCH. Firecracker runtime assets require x86_64 Linux.${RESET}" >&2
+  echo "    For local development and unit tests, run: cargo test --workspace" >&2
+  echo "    For microVM execution, use an x86_64 Linux VM with KVM exposed." >&2
+  exit 1
 fi
 
 if [[ -e /dev/kvm ]]; then
@@ -112,7 +146,11 @@ echo ""
 # -----------------------------------------------------------------------------
 echo -e "${BOLD}[2/7] Configuring host KVM & Jailer isolation...${RESET}"
 
-if id -u jailer >/dev/null 2>&1 && [[ -d /var/lib/cratera ]] && [[ -r /dev/kvm && -w /dev/kvm ]]; then
+if [[ "$(id -u jailer 2>/dev/null || true)" == "20001" ]] \
+  && [[ "$(id -g jailer 2>/dev/null || true)" == "20001" ]] \
+  && getent group 20001 >/dev/null 2>&1 \
+  && [[ -d /var/lib/cratera ]] \
+  && [[ -r /dev/kvm && -w /dev/kvm ]]; then
   echo -e "${GREEN}  ✓ Host Jailer user (UID 20001) and /var/lib/cratera ready${RESET}"
 else
   if [[ "$UNATTENDED" -eq 1 ]]; then
@@ -136,6 +174,11 @@ else
       echo "  Skipping sudo host setup."
     fi
   fi
+fi
+
+if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+  echo -e "${RED}  ✗ /dev/kvm is unavailable after host setup. Enable KVM and rerun the installer.${RESET}" >&2
+  exit 1
 fi
 
 echo ""
@@ -181,25 +224,25 @@ echo ""
 echo -e "${BOLD}[5/7] Select Language Runtimes to Install in MicroVM Guest...${RESET}"
 echo -e "  ${DIM}Tip: You can enable/disable any language anytime in languages.toml${RESET}"
 
-TARGET_LANGS="${LANGUAGES:-}"
+TARGET_LANGS="${CLI_LANGUAGES:-${LANGUAGES:-}}"
 EXTRA_APT=""
 
 if [[ -z "$TARGET_LANGS" ]]; then
   if [[ "$UNATTENDED" -eq 1 ]]; then
-    TARGET_LANGS="all"
+    TARGET_LANGS="minimal"
   else
-    echo "  1) Top 10 Core (Rust, Python, Node, TS, Go, C++, C, Java, C#, Ruby) [Default]"
+    echo "  1) Top 10 Core (Rust, Python, Node, TS, Go, C++, C, Java, C#, Ruby)"
     echo "  2) Top 30 All-Inclusive (Enables Swift, Kotlin, Zig, Dart, Julia, Scala, Haskell, etc.)"
     echo "  3) Web & Scripting (Rust, Python, Node.js, TypeScript, Ruby, PHP, Lua)"
     echo "  4) Core Systems (Rust, C, C++, Go, Zig, Nim, D, Fortran)"
-    echo "  5) Minimal (Rust 2024 only — ultra-fast build & 500MB rootfs)"
+    echo "  5) Minimal (Rust 2024 only — fastest build & smallest rootfs) [Default]"
     echo "  6) Custom Selection (Enter comma-separated names from languages.toml)"
     echo ""
-    read -r -p "  Select preset [1-6] (default: 1): " lang_choice
-    lang_choice="${lang_choice:-1}"
+    read -r -p "  Select preset [1-6] (default: 5): " lang_choice
+    lang_choice="${lang_choice:-5}"
 
     case "$lang_choice" in
-      1) TARGET_LANGS="all" ;;
+      1) TARGET_LANGS="python,node,rust,cpp,c,go,java,csharp,typescript,ruby" ;;
       2)
         # Enable all top 30 in languages.toml
         sed -i 's/^enabled = false/enabled = true/' languages.toml
@@ -217,12 +260,18 @@ if [[ -z "$TARGET_LANGS" ]]; then
         echo "  haskell, elixir, erlang, clojure, ocaml, perl, d, fortran, fsharp, bash"
         echo ""
         read -r -p "  Enter comma-separated languages (e.g. rust,python,zig,swift): " custom_langs
-        TARGET_LANGS="${custom_langs:-all}"
+        TARGET_LANGS="${custom_langs:-minimal}"
         ;;
-      *) TARGET_LANGS="all" ;;
+      *) TARGET_LANGS="minimal" ;;
     esac
   fi
 fi
+
+case "${TARGET_LANGS,,}" in
+  top10)
+    TARGET_LANGS="python,node,rust,cpp,c,go,java,csharp,typescript,ruby"
+    ;;
+esac
 
 echo ""
 
@@ -242,32 +291,14 @@ echo ""
 # -----------------------------------------------------------------------------
 echo -e "${BOLD}[7/7] Systemd Service Installation & Setup...${RESET}"
 
+DO_SYSTEMD=0
 if [[ "$WANT_SERVICE" -eq 1 ]]; then
   DO_SYSTEMD=1
-elif [[ "$UNATTENDED" -eq 1 ]]; then
-  DO_SYSTEMD=0
-else
-  echo "  Cratera includes a systemd service unit configured with"
-  echo "  eBPF network sandboxing, cgroups v2 delegation, and automatic crash recovery."
-  read -r -p "  Install & enable systemd service now? [Y/n]: " svc_choice
-  svc_choice="${svc_choice:-Y}"
-  if [[ "$svc_choice" =~ ^[Yy]$ ]]; then
-    DO_SYSTEMD=1
-  else
-    DO_SYSTEMD=0
-  fi
 fi
 
 if [[ "${DO_SYSTEMD:-0}" -eq 1 ]]; then
-  if [[ "$(id -u)" -eq 0 ]]; then
-    cp deploy/cratera.service /etc/systemd/system/
-    systemctl daemon-reload
-    systemctl enable --now cratera.service
-  else
-    sudo cp deploy/cratera.service /etc/systemd/system/
-    sudo systemctl daemon-reload
-    sudo systemctl enable --now cratera.service
-  fi
+  cargo build --release -p cratera
+  ./target/release/cratera service enable
   echo -e "${GREEN}  ✓ Cratera systemd service installed, enabled on boot & active${RESET}"
 else
   echo -e "${DIM}  Skipping systemd installation. You can start Cratera manually or enable later.${RESET}"
@@ -290,10 +321,10 @@ if [[ "${DO_SYSTEMD:-0}" -eq 1 ]]; then
   echo -e "  ${BOLD}sudo journalctl -u cratera.service -f${RESET}"
 else
   echo -e "To start the server manually:"
-  echo -e "  ${BOLD}cargo run --release --bin cratera${RESET}"
+  echo -e "  ${BOLD}./target/release/cratera serve${RESET}"
   echo ""
-  echo -e "Or enable as a 24/7 background systemd service anytime:"
-  echo -e "  ${BOLD}sudo cp deploy/cratera.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now cratera.service${RESET}"
+  echo -e "Run that command from the repository root. To opt into systemd later, run:"
+  echo -e "  ${BOLD}./target/release/cratera service enable${RESET}"
 fi
 echo ""
 echo -e "To test code execution in an isolated microVM:"
@@ -304,5 +335,5 @@ echo -e "    -d '{\"language\":\"rust\",\"code\":\"fn main(){println!(\\\"Hello 
 echo ""
 echo -e "To add, remove, or update languages:"
 echo -e "  1. Edit ${BOLD}languages.toml${RESET}"
-echo -e "  2. Run ${BOLD}./scripts/install.sh${RESET}"
+echo -e "  2. Run ${BOLD}./scripts/install.sh --yes --languages=all${RESET}"
 echo ""

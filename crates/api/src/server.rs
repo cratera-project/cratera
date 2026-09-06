@@ -60,7 +60,11 @@ pub fn log_file_path() -> PathBuf {
 pub fn get_server_pid() -> Option<u32> {
     let pid_file = pid_file_path();
     if let Ok(content) = fs::read_to_string(&pid_file) {
-        content.trim().parse::<u32>().ok()
+        content
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|pid| PathBuf::from(format!("/proc/{pid}")).exists())
     } else {
         None
     }
@@ -87,12 +91,12 @@ pub async fn get_server_addr() -> String {
 pub async fn stop_server() -> bool {
     let pid_path = pid_file_path();
     let mut stopped = false;
+    let managed_pid = get_server_pid();
 
-    if let Some(pid) = get_server_pid() {
+    if let Some(pid) = managed_pid {
         let _ = std::process::Command::new("kill")
             .args(["-15", &pid.to_string()])
             .output();
-        let _ = fs::remove_file(&pid_path);
         stopped = true;
     }
 
@@ -100,12 +104,13 @@ pub async fn stop_server() -> bool {
     for _ in 0..20 {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         if !is_server_running().await {
+            let _ = fs::remove_file(&pid_path);
             return true;
         }
     }
 
     // If still alive, issue SIGKILL
-    if let Some(pid) = get_server_pid() {
+    if let Some(pid) = managed_pid {
         let _ = std::process::Command::new("kill")
             .args(["-9", &pid.to_string()])
             .output();
@@ -117,15 +122,13 @@ pub async fn stop_server() -> bool {
 }
 
 pub async fn start_server_background() -> anyhow::Result<String> {
-    let bind_addr = std::env::var("CRATERA_BIND")
-        .or_else(|_| std::env::var("GRADE_BIND"))
-        .unwrap_or_else(|_| "127.0.0.1:3100".into());
+    let bind_addr = configured_bind_addr()?.to_string();
 
     if is_server_running().await {
         if let Some(pid) = get_server_pid() {
             return Ok(format!("{bind_addr} [PID {pid}]"));
         }
-        return Ok(bind_addr);
+        anyhow::bail!("{bind_addr} is already in use by an unmanaged process or system service");
     }
 
     let exe = std::env::current_exe().context("Failed to get current binary path")?;
@@ -149,7 +152,7 @@ pub async fn start_server_background() -> anyhow::Result<String> {
     #[cfg(unix)]
     cmd.process_group(0); // Detach process group so closing parent terminal won't kill child
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .context("Failed to spawn background cratera server process")?;
     let pid = child.id();
@@ -161,12 +164,25 @@ pub async fn start_server_background() -> anyhow::Result<String> {
         if is_server_running().await {
             return Ok(format!("{bind_addr} [PID {pid}]"));
         }
+        if let Some(status) = child
+            .try_wait()
+            .context("Failed to inspect background server")?
+        {
+            anyhow::bail!(
+                "background server exited before becoming ready (status {status}); see {}",
+                log_path.display()
+            );
+        }
     }
 
-    Ok(format!("{bind_addr} [PID {pid}]"))
+    anyhow::bail!(
+        "background server did not become ready at {bind_addr}; see {}",
+        log_path.display()
+    )
 }
 
 pub async fn start_server() -> anyhow::Result<()> {
+    let addr = configured_bind_addr()?;
     let key = std::env::var("CRATERA_INTERNAL_KEY")
         .or_else(|_| std::env::var("GRADE_INTERNAL_KEY"))
         .unwrap_or_else(|_| {
@@ -174,9 +190,9 @@ pub async fn start_server() -> anyhow::Result<()> {
             "dev-key".into()
         });
     let production = std::env::var("NODE_ENV").as_deref() == Ok("production");
-    if production && api_key_unfit_for_production(&key) {
+    if (!addr.ip().is_loopback() || production) && api_key_unfit_for_production(&key) {
         anyhow::bail!(
-            "CRATERA_INTERNAL_KEY is a placeholder or shorter than 16 characters; set a random production key"
+            "CRATERA_INTERNAL_KEY is required and must be a random key of at least 16 characters when binding off-loopback (or in production)"
         );
     }
 
@@ -193,7 +209,7 @@ pub async fn start_server() -> anyhow::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(MAX_TIME_MS);
 
-    let cfg = ExecutorConfig::from_env();
+    let cfg = ExecutorConfig::try_from_env().map_err(anyhow::Error::msg)?;
     if production && !cfg.use_jailer {
         anyhow::bail!("Jailer required in production (CRATERA_USE_JAILER=0 is set)");
     }
@@ -208,6 +224,9 @@ pub async fn start_server() -> anyhow::Result<()> {
         rootfs = %cfg.rootfs.display(),
         jailer = cfg.use_jailer,
         snapshot = cfg.use_snapshot,
+        max_concurrent_jobs = cfg.max_concurrent_jobs,
+        max_queued_jobs = cfg.max_queued_jobs,
+        queue_timeout_ms = cfg.queue_timeout.as_millis() as u64,
         default_language = %cfg.languages.default_language,
         "executor config"
     );
@@ -223,6 +242,7 @@ pub async fn start_server() -> anyhow::Result<()> {
         submit_timeout_ms: submit_ms,
         max_time_ms,
     });
+    let shutdown_executor = state.executor.clone();
 
     let app = Router::new()
         .route(
@@ -234,19 +254,39 @@ pub async fn start_server() -> anyhow::Result<()> {
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_SIZE))
         .with_state(state);
 
-    let addr: SocketAddr = std::env::var("CRATERA_BIND")
-        .or_else(|_| std::env::var("GRADE_BIND"))
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 3100)));
     if production && !addr.ip().is_loopback() {
         anyhow::bail!("CRATERA_BIND must be loopback in production (got {addr})");
     }
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!(%addr, "cratera listening");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            shutdown_executor.shutdown();
+            info!("shutdown signal received; stopping active jobs");
+        })
+        .await?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let ctrl_c = tokio::signal::ctrl_c();
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = terminate.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 pub async fn harness(
@@ -256,6 +296,14 @@ pub async fn harness(
 ) -> Result<Json<HarnessResult>, (StatusCode, Json<serde_json::Value>)> {
     if !bearer_ok(&headers, &state.internal_key) {
         return Err(json_err(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+
+    if !matches!(req.mode.as_str(), "run" | "submit") {
+        return Err(json_err_with_code(
+            StatusCode::BAD_REQUEST,
+            "unsupported mode",
+            "unsupported_mode",
+        ));
     }
 
     let resolved_lang = state
@@ -284,7 +332,7 @@ pub async fn harness(
             (src, state.run_timeout_ms)
         }
         "submit" => (source, state.submit_timeout_ms),
-        _ => (source, state.run_timeout_ms),
+        _ => unreachable!("harness mode was validated above"),
     };
     let time_ms = time_ms.min(state.max_time_ms);
     let language = resolved_lang.key.clone();
@@ -329,17 +377,50 @@ pub async fn harness(
             Ok(Json(result))
         }
         Err(ExecError::Busy) => {
-            tracing::warn!(language = %language, "job_record");
+            tracing::warn!(language = %language, reason = "queue_timeout", "job_record");
             Err((
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error":"busy","unavailable":true})),
+                Json(
+                    serde_json::json!({"error":"queue timeout","code":"queue_timeout","unavailable":true}),
+                ),
+            ))
+        }
+        Err(ExecError::QueueFull) => {
+            tracing::warn!(language = %language, reason = "queue_full", "job_record");
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(
+                    serde_json::json!({"error":"queue full","code":"queue_full","unavailable":true}),
+                ),
+            ))
+        }
+        Err(ExecError::ExecutionDeadline) => {
+            tracing::error!(language = %language, reason = "execution_deadline", "job_record");
+            Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({
+                    "error":"execution deadline exceeded",
+                    "code":"execution_deadline",
+                    "unavailable":true
+                })),
+            ))
+        }
+        Err(ExecError::BootTimeout) => {
+            tracing::error!(language = %language, reason = "boot_timeout", "job_record");
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error":"microVM boot timed out",
+                    "code":"boot_timeout",
+                    "unavailable":true
+                })),
             ))
         }
         Err(ExecError::Failed(msg)) => {
             tracing::error!(language = %language, error = %msg, "job_record");
             Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error":"judge failed","unavailable":true})),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error":"internal error","code":"internal_error"})),
             ))
         }
     }
@@ -377,9 +458,33 @@ fn json_err(status: StatusCode, message: &str) -> (StatusCode, Json<serde_json::
     (status, Json(serde_json::json!({"error": message})))
 }
 
+fn json_err_with_code(
+    status: StatusCode,
+    message: &str,
+    code: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        status,
+        Json(serde_json::json!({"error": message, "code": code})),
+    )
+}
+
+fn configured_bind_addr() -> anyhow::Result<SocketAddr> {
+    let bind = std::env::var("CRATERA_BIND")
+        .or_else(|_| std::env::var("GRADE_BIND"))
+        .unwrap_or_else(|_| "127.0.0.1:3100".into());
+    parse_bind_addr(&bind)
+}
+
+fn parse_bind_addr(bind: &str) -> anyhow::Result<SocketAddr> {
+    bind.parse::<SocketAddr>()
+        .with_context(|| format!("CRATERA_BIND must be a valid socket address (got {bind})"))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::api_key_unfit_for_production;
+    use super::{api_key_unfit_for_production, parse_bind_addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     #[test]
     fn rejects_short_and_example_keys() {
@@ -389,5 +494,28 @@ mod tests {
         assert!(!api_key_unfit_for_production(
             "a-sufficiently-long-random-token"
         ));
+    }
+
+    #[test]
+    fn bind_parser_supports_ipv4_and_ipv6_socket_addresses() {
+        let ipv4: SocketAddr = "127.0.0.1:3100".parse().unwrap();
+        let ipv6: SocketAddr = "[::1]:3100".parse().unwrap();
+        assert_eq!(ipv4.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(ipv6.ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
+        assert!(
+            !"0.0.0.0:3100"
+                .parse::<SocketAddr>()
+                .unwrap()
+                .ip()
+                .is_loopback()
+        );
+        assert!(
+            !"[::]:3100"
+                .parse::<SocketAddr>()
+                .unwrap()
+                .ip()
+                .is_loopback()
+        );
+        assert!(parse_bind_addr("localhost:3100").is_err());
     }
 }

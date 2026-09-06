@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::Command;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const BOLD: &str = "\x1b[1m";
 const GREEN: &str = "\x1b[32m";
@@ -50,7 +50,7 @@ fn is_root() -> bool {
     unsafe { geteuid() == 0 }
 }
 
-fn run_privileged_cmd(cmd: &str, args: &[&str]) -> anyhow::Result<bool> {
+fn run_privileged_cmd(cmd: &str, args: &[&str]) -> anyhow::Result<()> {
     let mut command = if is_root() {
         let mut c = Command::new(cmd);
         c.args(args);
@@ -63,7 +63,36 @@ fn run_privileged_cmd(cmd: &str, args: &[&str]) -> anyhow::Result<bool> {
     };
 
     let status = command.status()?;
-    Ok(status.success())
+    if !status.success() {
+        anyhow::bail!("command failed ({status}): {cmd} {}", args.join(" "));
+    }
+    Ok(())
+}
+
+fn atomic_install(src: &str, destination: &str) -> anyhow::Result<()> {
+    let destination_path = Path::new(destination);
+    let parent = destination_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("destination has no parent: {destination}"))?;
+    let file_name = destination_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("invalid destination filename: {destination}"))?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let staged = parent
+        .join(format!(".{file_name}.tmp.{}.{nonce}", std::process::id()))
+        .to_string_lossy()
+        .into_owned();
+
+    run_privileged_cmd("install", &["-m", "755", src, &staged])?;
+    if let Err(error) = run_privileged_cmd("mv", &["-f", &staged, destination]) {
+        let _ = run_privileged_cmd("rm", &["-f", &staged]);
+        return Err(error);
+    }
+    Ok(())
 }
 
 pub fn deploy_to_opt() -> anyhow::Result<bool> {
@@ -93,10 +122,11 @@ pub fn deploy_to_opt() -> anyhow::Result<bool> {
     };
 
     println!("  -> Installing binary {bin_src} -> {OPT_BIN}");
-    run_privileged_cmd("cp", &[bin_src, OPT_BIN])?;
-    run_privileged_cmd("chmod", &["755", OPT_BIN])?;
-    run_privileged_cmd("cp", &[bin_src, "/usr/local/bin/cratera"])?;
-    run_privileged_cmd("chmod", &["755", "/usr/local/bin/cratera"])?;
+    // Never overwrite the inode of a running executable. Install beside it,
+    // then atomically rename so the old process can finish on its old inode
+    // and the next systemd start is guaranteed to use the new binary.
+    atomic_install(bin_src, OPT_BIN)?;
+    atomic_install(bin_src, "/usr/local/bin/cratera")?;
 
     // 3. Copy languages.toml
     if Path::new("languages.toml").exists() {
@@ -118,6 +148,15 @@ pub fn deploy_to_opt() -> anyhow::Result<bool> {
             "cp",
             &["images/vmlinux.bin", "/opt/cratera/images/vmlinux.bin"],
         )?;
+        if Path::new("images/vmlinux.bin.sha256").exists() {
+            run_privileged_cmd(
+                "cp",
+                &[
+                    "images/vmlinux.bin.sha256",
+                    "/opt/cratera/images/vmlinux.bin.sha256",
+                ],
+            )?;
+        }
     }
     if Path::new("images/rootfs.squashfs").exists() {
         run_privileged_cmd(
@@ -131,11 +170,38 @@ pub fn deploy_to_opt() -> anyhow::Result<bool> {
             "ln",
             &["-sfn", "rootfs.squashfs", "/opt/cratera/images/rootfs.ext4"],
         )?;
+        if Path::new("images/rootfs.squashfs.sha256").exists() {
+            run_privileged_cmd(
+                "cp",
+                &[
+                    "images/rootfs.squashfs.sha256",
+                    "/opt/cratera/images/rootfs.squashfs.sha256",
+                ],
+            )?;
+            // The configured production path is the ext4-compatible alias;
+            // verify_guest_images looks for a sidecar beside that exact path.
+            run_privileged_cmd(
+                "cp",
+                &[
+                    "images/rootfs.squashfs.sha256",
+                    "/opt/cratera/images/rootfs.ext4.sha256",
+                ],
+            )?;
+        }
     } else if Path::new("images/rootfs.ext4").exists() {
         run_privileged_cmd(
             "cp",
             &["images/rootfs.ext4", "/opt/cratera/images/rootfs.ext4"],
         )?;
+        if Path::new("images/rootfs.ext4.sha256").exists() {
+            run_privileged_cmd(
+                "cp",
+                &[
+                    "images/rootfs.ext4.sha256",
+                    "/opt/cratera/images/rootfs.ext4.sha256",
+                ],
+            )?;
+        }
     }
 
     // 5. Copy .env if available
@@ -147,7 +213,7 @@ pub fn deploy_to_opt() -> anyhow::Result<bool> {
     // 6. Host setup & permissions
     if Path::new("scripts/host-setup.sh").exists() {
         println!("  -> Configuring KVM & Jailer UID 20001 permissions...");
-        let _ = run_privileged_cmd("bash", &["scripts/host-setup.sh"]);
+        run_privileged_cmd("bash", &["scripts/host-setup.sh"])?;
     }
 
     // 7. Copy systemd unit file
@@ -167,8 +233,8 @@ pub fn start_service() -> anyhow::Result<()> {
     }
 
     println!("==> Starting {SERVICE_NAME} via systemd...");
-    let _ = run_privileged_cmd("systemctl", &["reset-failed", SERVICE_NAME]);
-    let _ = run_privileged_cmd("systemctl", &["start", SERVICE_NAME]);
+    run_privileged_cmd("systemctl", &["reset-failed", SERVICE_NAME])?;
+    run_privileged_cmd("systemctl", &["start", SERVICE_NAME])?;
 
     // Give systemd a moment to launch and verify liveness
     sleep(Duration::from_millis(600));
@@ -184,7 +250,7 @@ pub fn start_service() -> anyhow::Result<()> {
 
 pub fn stop_service() -> anyhow::Result<()> {
     println!("==> Stopping {SERVICE_NAME} via systemd...");
-    let _ = run_privileged_cmd("systemctl", &["stop", SERVICE_NAME]);
+    run_privileged_cmd("systemctl", &["stop", SERVICE_NAME])?;
     sleep(Duration::from_millis(300));
     if !is_service_active() {
         println!("{YELLOW}✓ {SERVICE_NAME} stopped.{RESET}");
@@ -195,14 +261,14 @@ pub fn stop_service() -> anyhow::Result<()> {
 }
 
 pub fn restart_service() -> anyhow::Result<()> {
-    if !is_service_installed() {
-        deploy_to_opt()?;
-    }
+    // Restart is also the update path: deploy the invoking build and current
+    // unit template before asking systemd to launch it.
+    deploy_to_opt()?;
 
     println!("==> Restarting {SERVICE_NAME} via systemd...");
-    let _ = run_privileged_cmd("systemctl", &["daemon-reload"]);
-    let _ = run_privileged_cmd("systemctl", &["reset-failed", SERVICE_NAME]);
-    let _ = run_privileged_cmd("systemctl", &["restart", SERVICE_NAME]);
+    run_privileged_cmd("systemctl", &["daemon-reload"])?;
+    run_privileged_cmd("systemctl", &["reset-failed", SERVICE_NAME])?;
+    run_privileged_cmd("systemctl", &["restart", SERVICE_NAME])?;
 
     sleep(Duration::from_millis(600));
 
@@ -249,8 +315,8 @@ pub fn install_and_enable() -> anyhow::Result<()> {
     deploy_to_opt()?;
 
     println!("==> Enabling {SERVICE_NAME} on system boot...");
-    let _ = run_privileged_cmd("systemctl", &["daemon-reload"]);
-    let _ = run_privileged_cmd("systemctl", &["enable", "--now", SERVICE_NAME]);
+    run_privileged_cmd("systemctl", &["daemon-reload"])?;
+    run_privileged_cmd("systemctl", &["enable", "--now", SERVICE_NAME])?;
 
     sleep(Duration::from_millis(600));
 
@@ -267,11 +333,8 @@ pub fn install_and_enable() -> anyhow::Result<()> {
 
 pub fn disable_service() -> anyhow::Result<()> {
     println!("==> Disabling {SERVICE_NAME} from auto-start on boot...");
-    if run_privileged_cmd("systemctl", &["disable", "--now", SERVICE_NAME])? {
-        println!("{YELLOW}✓ {SERVICE_NAME} disabled and stopped.{RESET}");
-    } else {
-        eprintln!("{RED}✗ Failed to disable {SERVICE_NAME}.{RESET}");
-    }
+    run_privileged_cmd("systemctl", &["disable", "--now", SERVICE_NAME])?;
+    println!("{YELLOW}✓ {SERVICE_NAME} disabled and stopped.{RESET}");
     Ok(())
 }
 
