@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tracing::{info, warn};
@@ -25,6 +25,7 @@ const POWEROFF_GRACE: Duration = Duration::from_secs(3);
 const SNAP_WAIT: Duration = Duration::from_secs(60);
 const SNAP_CREATE_WAIT: Duration = Duration::from_secs(180);
 const SNAP_LOCK_WAIT: Duration = Duration::from_secs(60);
+const SNAP_READ_LOCK_WAIT: Duration = Duration::from_millis(500);
 const SNAPSHOT_FINGERPRINT_VERSION: &str = "cratera-snapshot-v1";
 const UNIX_SOCKET_PATH_MAX: usize = 108;
 const JAIL_MEMORY_MAX: &str = "3221225472";
@@ -687,10 +688,15 @@ fn validate_cpu_max(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Clone)]
 pub struct FirecrackerExecutor {
     cfg: ExecutorConfig,
     limiter: ExecutionLimiter,
+    active_jobs: ActiveJobs,
+    shutting_down: Arc<AtomicBool>,
 }
+
+type ActiveJobs = Arc<Mutex<std::collections::HashMap<String, u32>>>;
 
 #[derive(Clone)]
 struct ExecutionLimiter {
@@ -738,6 +744,17 @@ impl ExecutionLimiter {
             _admission: admission,
         })
     }
+
+    /// Wake all waiters and prevent new admissions during executor shutdown.
+    ///
+    /// Closing both semaphores is intentional: a waiter may already hold an
+    /// admission permit while waiting for a running slot. Tokio wakes both
+    /// classes of waiters, and any partially acquired admission permit is
+    /// dropped by `acquire` on the closed-slot error path.
+    fn shutdown(&self) {
+        self.admissions.close();
+        self.slots.close();
+    }
 }
 
 impl FirecrackerExecutor {
@@ -747,11 +764,36 @@ impl FirecrackerExecutor {
             cfg.max_queued_jobs,
             cfg.queue_timeout,
         );
-        Self { cfg, limiter }
+        Self {
+            cfg,
+            limiter,
+            active_jobs: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            shutting_down: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     pub fn config(&self) -> &ExecutorConfig {
         &self.cfg
+    }
+
+    /// Stop jobs owned by this executor. Every process and cgroup target is
+    /// derived from the job registry, so shutdown cannot affect another
+    /// Cratera instance or an unrelated Firecracker process.
+    pub fn shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+        self.limiter.shutdown();
+        let active = self
+            .active_jobs
+            .lock()
+            .map(|jobs| {
+                jobs.iter()
+                    .map(|(id, pid)| (id.clone(), *pid))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for (job_id, pid) in active {
+            kill_job_resources(&job_id, pid);
+        }
     }
 
     pub fn ensure_snapshot(&self) -> Result<(), ExecError> {
@@ -769,7 +811,7 @@ impl FirecrackerExecutor {
         let fingerprint = match snapshot_fingerprint(&self.cfg) {
             Ok(fingerprint) => fingerprint,
             Err(error) => {
-                let _ = fs::remove_file(&snap.fingerprint);
+                invalidate_snapshot(&self.cfg);
                 return Err(error);
             }
         };
@@ -809,11 +851,17 @@ impl FirecrackerExecutor {
         timeout_ms: u64,
         lang: Option<ResolvedLanguage>,
     ) -> Result<JobOutcome, ExecError> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(ExecError::Failed("executor shutting down".into()));
+        }
         let request_start = Instant::now();
         let budget = execution_budget(&self.cfg, timeout_ms)?;
         let deadline = Deadline::from_now(budget)?;
         let mut cancellation = CancellationGuard::new(deadline.clone());
         let permit = self.limiter.acquire(&deadline).await?;
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(ExecError::Failed("executor shutting down".into()));
+        }
         let cfg = self.cfg.clone();
         let target_lang = lang.unwrap_or_else(|| {
             self.cfg
@@ -823,6 +871,8 @@ impl FirecrackerExecutor {
         });
         let (tx, rx) = oneshot::channel();
         let worker_deadline = deadline.clone();
+        let active_jobs = self.active_jobs.clone();
+        let shutting_down = self.shutting_down.clone();
         tokio::task::spawn_blocking(move || {
             let result = run_sync(
                 &cfg,
@@ -832,6 +882,8 @@ impl FirecrackerExecutor {
                 request_start,
                 worker_deadline,
                 tx,
+                &active_jobs,
+                &shutting_down,
             );
             drop(permit);
             if let Err(e) = &result {
@@ -873,37 +925,114 @@ struct JobLayout {
 struct SnapPaths {
     state: PathBuf,
     mem: PathBuf,
-    fingerprint: PathBuf,
+    manifest: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SnapshotManifest {
+    version: String,
+    fingerprint: String,
+    state_size: u64,
+    mem_size: u64,
+    state_sha256: String,
+    mem_sha256: String,
 }
 
 impl SnapPaths {
     fn ready(&self) -> bool {
-        self.state
-            .metadata()
-            .map(|metadata| metadata.is_file() && metadata.len() > 0)
+        self.read_manifest()
+            .map(|manifest| self.matches_manifest(&manifest))
             .unwrap_or(false)
-            && self
-                .mem
-                .metadata()
-                .map(|metadata| metadata.is_file() && metadata.len() > 0)
-                .unwrap_or(false)
-            && self.fingerprint.is_file()
+    }
+
+    /// Check the durable publication marker and verify the snapshot contents.
+    ///
+    /// This runs while the caller holds the shared snapshot lock. The files
+    /// are published atomically, so hashing them here prevents a same-size
+    /// modification from being accepted as a valid restore image.
+    fn published(&self) -> bool {
+        let Some(manifest) = self.read_manifest() else {
+            return false;
+        };
+        if manifest.version != SNAPSHOT_FINGERPRINT_VERSION
+            || manifest.fingerprint.is_empty()
+            || !valid_snapshot_digest(&manifest.state_sha256)
+            || !valid_snapshot_digest(&manifest.mem_sha256)
+        {
+            return false;
+        }
+        self.matches_manifest(&manifest)
     }
 
     fn matches_fingerprint(&self, fingerprint: &str) -> bool {
-        self.ready()
-            && fs::read_to_string(&self.fingerprint)
-                .map(|stored| stored == fingerprint)
-                .unwrap_or(false)
+        self.read_manifest()
+            .map(|manifest| manifest.fingerprint == fingerprint && self.matches_manifest(&manifest))
+            .unwrap_or(false)
     }
+
+    fn read_manifest(&self) -> Option<SnapshotManifest> {
+        let text = fs::read_to_string(&self.manifest).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    fn matches_manifest(&self, manifest: &SnapshotManifest) -> bool {
+        if manifest.version != SNAPSHOT_FINGERPRINT_VERSION {
+            return false;
+        }
+        let state = snapshot_file_info(&self.state).ok();
+        let mem = snapshot_file_info(&self.mem).ok();
+        match (state, mem) {
+            (Some(state), Some(mem)) => {
+                state.size == manifest.state_size
+                    && mem.size == manifest.mem_size
+                    && state.sha256 == manifest.state_sha256
+                    && mem.sha256 == manifest.mem_sha256
+            }
+            _ => false,
+        }
+    }
+}
+
+fn valid_snapshot_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn snap_paths(cfg: &ExecutorConfig) -> SnapPaths {
     SnapPaths {
         state: cfg.snapshot_dir.join("vm.snap"),
         mem: cfg.snapshot_dir.join("vm.mem"),
-        fingerprint: cfg.snapshot_dir.join("vm.fingerprint"),
+        manifest: cfg.snapshot_dir.join("vm.manifest.json"),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotFileInfo {
+    size: u64,
+    sha256: String,
+}
+
+fn snapshot_file_info(path: &Path) -> Result<SnapshotFileInfo, ExecError> {
+    let before = fs::metadata(path).map_err(io_err)?;
+    if !before.is_file() || before.len() == 0 {
+        return Err(ExecError::Failed(format!(
+            "snapshot file {} is missing or empty",
+            path.display()
+        )));
+    }
+    let digest = image_hash::sha256_file(path).map_err(|error| {
+        ExecError::Failed(format!("hash snapshot file {}: {error}", path.display()))
+    })?;
+    let after = fs::metadata(path).map_err(io_err)?;
+    if before.len() != after.len() {
+        return Err(ExecError::Failed(format!(
+            "snapshot file {} changed while hashing",
+            path.display()
+        )));
+    }
+    Ok(SnapshotFileInfo {
+        size: after.len(),
+        sha256: format_digest(digest),
+    })
 }
 
 struct SnapshotLock {
@@ -922,6 +1051,18 @@ impl Drop for SnapshotLock {
 }
 
 fn acquire_snapshot_lock(cfg: &ExecutorConfig) -> Result<SnapshotLock, ExecError> {
+    acquire_snapshot_lock_with_mode(cfg, libc::LOCK_EX, SNAP_LOCK_WAIT)
+}
+
+fn acquire_snapshot_shared_lock(cfg: &ExecutorConfig) -> Result<SnapshotLock, ExecError> {
+    acquire_snapshot_lock_with_mode(cfg, libc::LOCK_SH, SNAP_READ_LOCK_WAIT)
+}
+
+fn acquire_snapshot_lock_with_mode(
+    cfg: &ExecutorConfig,
+    lock_mode: libc::c_int,
+    wait: Duration,
+) -> Result<SnapshotLock, ExecError> {
     fs::create_dir_all(&cfg.snapshot_dir).map_err(io_err)?;
     let path = cfg.snapshot_dir.join(".snapshot.lock");
     let file = fs::OpenOptions::new()
@@ -931,9 +1072,9 @@ fn acquire_snapshot_lock(cfg: &ExecutorConfig) -> Result<SnapshotLock, ExecError
         .write(true)
         .open(&path)
         .map_err(io_err)?;
-    let deadline = Instant::now() + SNAP_LOCK_WAIT;
+    let deadline = Instant::now() + wait;
     loop {
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        let rc = unsafe { libc::flock(file.as_raw_fd(), lock_mode | libc::LOCK_NB) };
         if rc == 0 {
             return Ok(SnapshotLock { file });
         }
@@ -974,6 +1115,7 @@ fn format_digest(digest: [u8; 32]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_sync(
     cfg: &ExecutorConfig,
     source: &str,
@@ -982,33 +1124,66 @@ fn run_sync(
     wall_start: Instant,
     deadline: Deadline,
     tx: oneshot::Sender<Result<JobOutcome, ExecError>>,
+    active_jobs: &ActiveJobs,
+    shutting_down: &AtomicBool,
 ) -> Result<JobOutcome, ExecError> {
     let t_copy = Instant::now();
-    let layout = match prepare_job(cfg) {
+    // Hold a shared lock through manifest validation and snapshot hardlinks so
+    // an exclusive publisher cannot replace one file between those steps.
+    // The lock is released before the VM starts, allowing restores to run in
+    // parallel.
+    let snapshot_lock = if cfg.use_snapshot && cfg.use_jailer {
+        match acquire_snapshot_shared_lock(cfg) {
+            Ok(lock) => Some(lock),
+            Err(error) => {
+                warn!(error = %error, "snapshot lock unavailable; using cold boot");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let restore = snapshot_lock.is_some() && snap_paths(cfg).published();
+    let layout = match prepare_job(cfg, restore) {
         Ok(layout) => layout,
         Err(e) => {
             let _ = tx.send(Err(e.clone()));
             return Err(e);
         }
     };
+    drop(snapshot_lock);
     let copy_ms = t_copy.elapsed().as_millis() as u64;
     if let Err(error) = deadline.remaining() {
         cleanup(&layout.jail_root);
         let _ = tx.send(Err(error.clone()));
         return Err(error);
     }
+    if shutting_down.load(Ordering::Acquire) {
+        let error = ExecError::Failed("executor shutting down".into());
+        cleanup(&layout.jail_root);
+        let _ = tx.send(Err(error.clone()));
+        return Err(error);
+    }
 
-    let snap = snap_paths(cfg);
-    let restore = cfg.use_snapshot && cfg.use_jailer && snap.ready();
     let result = run_vm(
-        cfg, &layout, source, timeout_ms, copy_ms, restore, wall_start, &deadline, &lang,
+        cfg,
+        &layout,
+        source,
+        timeout_ms,
+        copy_ms,
+        restore,
+        wall_start,
+        &deadline,
+        &lang,
+        Some(active_jobs),
+        Some(shutting_down),
     );
     cleanup(&layout.jail_root);
     let _ = tx.send(result.clone());
     result
 }
 
-fn prepare_job(cfg: &ExecutorConfig) -> Result<JobLayout, ExecError> {
+fn prepare_job(cfg: &ExecutorConfig, restore: bool) -> Result<JobLayout, ExecError> {
     fs::create_dir_all(&cfg.work_dir).map_err(|error| {
         ExecError::Failed(format!(
             "create work directory {}: {error}",
@@ -1038,7 +1213,7 @@ fn prepare_job(cfg: &ExecutorConfig) -> Result<JobLayout, ExecError> {
         hardlink_or_copy(&cfg.rootfs, &rootfs_dst)?;
 
         let snap = snap_paths(cfg);
-        if cfg.use_snapshot && cfg.use_jailer && snap.ready() {
+        if restore {
             hardlink_or_copy(&snap.state, &jail_root.join("snapshot/vm.snap"))?;
             hardlink_or_copy(&snap.mem, &jail_root.join("snapshot/vm.mem"))?;
         }
@@ -1175,6 +1350,8 @@ fn run_vm(
     wall_start: Instant,
     deadline: &Deadline,
     lang: &ResolvedLanguage,
+    active_jobs: Option<&ActiveJobs>,
+    shutting_down: Option<&AtomicBool>,
 ) -> Result<JobOutcome, ExecError> {
     let operation_deadline = deadline.with_reserve(POWEROFF_GRACE)?;
     let mut child = if restore {
@@ -1182,12 +1359,20 @@ fn run_vm(
     } else {
         spawn_vm(cfg, layout, SpawnMode::ConfigNoApi, false)
     }?;
+    if let Some(active_jobs) = active_jobs {
+        if let Ok(mut jobs) = active_jobs.lock() {
+            jobs.insert(layout.id.clone(), child.id());
+        }
+        if shutting_down.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            kill_job_resources(&layout.id, child.id());
+        }
+    }
     let boot_t0 = Instant::now();
     info!(job = %layout.id, cid = layout.cid, restore, language = %lang.key, "microVM started");
 
     let rpc = (|| {
         if restore && let Err(e) = load_snapshot(cfg, layout, &operation_deadline) {
-            warn!(error = %e, "snapshot restore failed; killing VM");
+            warn!(error = %e, "snapshot restore failed");
             return Err(e);
         }
         let boot_deadline = Deadline {
@@ -1210,6 +1395,12 @@ fn run_vm(
         let job = send_job(&mut stream, source, timeout_ms, lang, &operation_deadline)?;
         Ok((job, boot_ms))
     })();
+    if restore && rpc.is_err() {
+        // A restored guest that cannot complete its agent handshake is no
+        // longer trustworthy for reuse. Keep the large files for diagnosis,
+        // but remove the durable publication marker so the next job cold boots.
+        invalidate_snapshot(cfg);
+    }
     let (rpc, boot_ms) = match rpc {
         Ok((job, boot_ms)) => (Ok(job), boot_ms),
         Err(e) => (Err(e), boot_t0.elapsed().as_millis() as u64),
@@ -1249,6 +1440,11 @@ fn run_vm(
     };
     let reap_t0 = Instant::now();
     reap_vm(layout, &mut child, Some(deadline));
+    if let Some(active_jobs) = active_jobs
+        && let Ok(mut jobs) = active_jobs.lock()
+    {
+        jobs.remove(&layout.id);
+    }
     info!(
         job = %layout.id,
         reap_ms = reap_t0.elapsed().as_millis() as u64,
@@ -1303,15 +1499,11 @@ fn load_snapshot(
 fn create_golden_snapshot(cfg: &ExecutorConfig, fingerprint: &str) -> Result<(), ExecError> {
     fs::create_dir_all(&cfg.snapshot_dir).map_err(io_err)?;
     let snap = snap_paths(cfg);
-    // Invalidate the publication marker before replacing either snapshot file.
-    // A crash during creation must force the next start to rebuild.
-    if let Err(error) = fs::remove_file(&snap.fingerprint)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        return Err(io_err(error));
-    }
+    // Invalidate the manifest before replacing either snapshot file. A crash
+    // during creation must force the next start to rebuild.
+    invalidate_snapshot(cfg);
     let t0 = Instant::now();
-    let layout = prepare_job(cfg)?;
+    let layout = prepare_job(cfg, false)?;
     let fc_log = layout.jail_root.join("config/fc.log");
     let _ = fs::write(&fc_log, b"");
     if cfg.use_jailer {
@@ -1368,7 +1560,7 @@ fn create_golden_snapshot(cfg: &ExecutorConfig, fingerprint: &str) -> Result<(),
         publish_snapshot_file(&src_state, &snap.state)?;
         publish_snapshot_file(&src_mem, &snap.mem)?;
         chmod_snapshot_group(cfg)?;
-        publish_snapshot_fingerprint(&snap.fingerprint, fingerprint)?;
+        publish_snapshot_manifest(&snap, fingerprint)?;
         Ok(())
     })();
     reap_vm(&layout, &mut child, None);
@@ -1400,7 +1592,7 @@ fn create_golden_snapshot(cfg: &ExecutorConfig, fingerprint: &str) -> Result<(),
             // The publication marker was removed before rebuilding, so old
             // files cannot be restored accidentally. Keep them available for
             // diagnosis and for a future successful rebuild.
-            let _ = fs::remove_file(snap_paths(cfg).fingerprint);
+            invalidate_snapshot(cfg);
             Err(e)
         }
     }
@@ -1411,25 +1603,68 @@ fn publish_snapshot_file(source: &Path, destination: &Path) -> Result<(), ExecEr
     let _ = fs::remove_file(&temporary);
     let result = (|| {
         fs::copy(source, &temporary).map_err(io_err)?;
+        fs::File::open(&temporary)
+            .map_err(io_err)?
+            .sync_all()
+            .map_err(io_err)?;
         fs::rename(&temporary, destination).map_err(io_err)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
-    result.map(|_| ())
+    result?;
+    sync_snapshot_dir(destination.parent().unwrap_or_else(|| Path::new(".")))
 }
 
-fn publish_snapshot_fingerprint(destination: &Path, fingerprint: &str) -> Result<(), ExecError> {
-    let temporary = snapshot_temp_path(destination);
+fn publish_snapshot_manifest(snap: &SnapPaths, fingerprint: &str) -> Result<(), ExecError> {
+    let state = snapshot_file_info(&snap.state)?;
+    let mem = snapshot_file_info(&snap.mem)?;
+    let manifest = SnapshotManifest {
+        version: SNAPSHOT_FINGERPRINT_VERSION.into(),
+        fingerprint: fingerprint.into(),
+        state_size: state.size,
+        mem_size: mem.size,
+        state_sha256: state.sha256,
+        mem_sha256: mem.sha256,
+    };
+    let temporary = snapshot_temp_path(&snap.manifest);
     let _ = fs::remove_file(&temporary);
     let result = (|| {
-        fs::write(&temporary, fingerprint).map_err(io_err)?;
-        fs::rename(&temporary, destination).map_err(io_err)
+        let mut file = fs::File::create(&temporary).map_err(io_err)?;
+        let encoded = serde_json::to_vec(&manifest)
+            .map_err(|error| ExecError::Failed(format!("serialize snapshot manifest: {error}")))?;
+        file.write_all(&encoded).map_err(io_err)?;
+        file.sync_all().map_err(io_err)?;
+        fs::rename(&temporary, &snap.manifest).map_err(io_err)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
-    result.map(|_| ())
+    result?;
+    sync_snapshot_dir(snap.manifest.parent().unwrap_or_else(|| Path::new(".")))
+}
+
+fn sync_snapshot_dir(directory: &Path) -> Result<(), ExecError> {
+    fs::File::open(directory)
+        .map_err(io_err)?
+        .sync_all()
+        .map_err(io_err)
+}
+
+fn invalidate_snapshot(cfg: &ExecutorConfig) {
+    invalidate_snapshot_manifest(&cfg.snapshot_dir, &snap_paths(cfg).manifest);
+}
+
+fn invalidate_snapshot_manifest(directory: &Path, manifest: &Path) {
+    let removed = fs::remove_file(manifest);
+    if removed.is_ok()
+        || removed
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+    {
+        let _ = sync_snapshot_dir(directory);
+    }
 }
 
 fn snapshot_temp_path(path: &Path) -> PathBuf {
@@ -1586,25 +1821,26 @@ fn read_cgroup_stats(job_id: &str) -> CgroupStats {
     CgroupStats::default()
 }
 
-fn reap_vm(layout: &JobLayout, child: &mut Child, deadline: Option<&Deadline>) {
-    let child_pid = child.id();
-    let _ = child.kill();
-
+fn kill_job_resources(job_id: &str, child_pid: u32) {
     if let Ok(process_group) = i32::try_from(child_pid) {
-        // SAFETY: the child was spawned into a dedicated process group, and the
-        // negative ID targets only that group with a fixed signal.
+        // SAFETY: every registered child was placed into its own process group.
         unsafe {
             libc::kill(-process_group, libc::SIGKILL);
         }
     }
-
     for base in CGROUP_BASES {
-        let kill_path = format!("{base}/{}/cgroup.kill", layout.id);
+        let kill_path = format!("{base}/{job_id}/cgroup.kill");
         let p = Path::new(&kill_path);
         if p.is_file() {
             let _ = fs::write(p, b"1\n");
         }
     }
+}
+
+fn reap_vm(layout: &JobLayout, child: &mut Child, deadline: Option<&Deadline>) {
+    let child_pid = child.id();
+    let _ = child.kill();
+    kill_job_resources(&layout.id, child_pid);
 
     let reap_limit = Instant::now() + Duration::from_secs(2);
     let reap_deadline = deadline.map_or(reap_limit, |deadline| deadline.at.min(reap_limit));
@@ -1615,6 +1851,10 @@ fn reap_vm(layout: &JobLayout, child: &mut Child, deadline: Option<&Deadline>) {
             Err(_) => break,
         }
     }
+    // SIGKILL is not expected to take this long for a Firecracker process, but
+    // always reap the exact child before removing its cgroup and jail. This
+    // prevents a late exit from becoming a coordinator-owned zombie.
+    let _ = child.wait();
 
     for base in CGROUP_BASES {
         let dir_path = format!("{base}/{}", layout.id);
@@ -2042,6 +2282,25 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn execution_limiter_shutdown_wakes_queued_work_immediately() {
+        let limiter = ExecutionLimiter::new(1, 1, Duration::from_secs(60));
+        let deadline = Deadline::from_now(Duration::from_secs(60)).unwrap();
+        let _running = limiter.acquire(&deadline).await.unwrap();
+        let queued_limiter = limiter.clone();
+        let queued_deadline = deadline.clone();
+        let queued = tokio::spawn(async move { queued_limiter.acquire(&queued_deadline).await });
+        tokio::task::yield_now().await;
+
+        limiter.shutdown();
+
+        let result = tokio::time::timeout(Duration::from_millis(100), queued)
+            .await
+            .expect("shutdown must wake queued work promptly")
+            .unwrap();
+        assert!(matches!(result, Err(ExecError::Failed(message)) if message == "executor closed"));
+    }
+
     #[test]
     fn http_204_does_not_wait_for_peer_close() {
         let unique = std::time::SystemTime::now()
@@ -2112,7 +2371,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_requires_matching_complete_files_and_fingerprint() {
+    fn snapshot_manifest_rejects_mismatch_and_truncation() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -2125,20 +2384,64 @@ mod tests {
         let snap = SnapPaths {
             state: dir.join("vm.snap"),
             mem: dir.join("vm.mem"),
-            fingerprint: dir.join("vm.fingerprint"),
+            manifest: dir.join("vm.manifest.json"),
         };
 
         fs::write(&snap.state, b"state").unwrap();
         fs::write(&snap.mem, b"memory").unwrap();
         assert!(!snap.ready());
 
-        fs::write(&snap.fingerprint, b"fingerprint\n").unwrap();
+        let state = snapshot_file_info(&snap.state).unwrap();
+        let mem = snapshot_file_info(&snap.mem).unwrap();
+        let manifest = SnapshotManifest {
+            version: SNAPSHOT_FINGERPRINT_VERSION.into(),
+            fingerprint: "fingerprint\n".into(),
+            state_size: state.size,
+            mem_size: mem.size,
+            state_sha256: state.sha256,
+            mem_sha256: mem.sha256,
+        };
+        fs::write(&snap.manifest, serde_json::to_vec(&manifest).unwrap()).unwrap();
         assert!(snap.ready());
+        assert!(snap.published());
         assert!(snap.matches_fingerprint("fingerprint\n"));
         assert!(!snap.matches_fingerprint("stale\n"));
 
-        fs::write(&snap.mem, []).unwrap();
+        fs::write(&snap.mem, b"truncated").unwrap();
         assert!(!snap.ready());
+        assert!(!snap.published());
+
+        // A same-size mutation must not bypass restore validation.
+        fs::write(&snap.mem, b"memory").unwrap();
+        assert!(snap.published());
+        fs::write(&snap.mem, b"MEMORY").unwrap();
+        assert!(!snap.published());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn snapshot_invalidation_removes_only_manifest() {
+        let dir = std::env::temp_dir().join(format!(
+            "cratera-snapshot-invalidate-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let state = dir.join("vm.snap");
+        let mem = dir.join("vm.mem");
+        let manifest = dir.join("vm.manifest.json");
+        fs::write(&state, b"state").unwrap();
+        fs::write(&mem, b"memory").unwrap();
+        fs::write(&manifest, b"manifest").unwrap();
+
+        invalidate_snapshot_manifest(&dir, &manifest);
+
+        assert!(!manifest.exists());
+        assert!(state.exists());
+        assert!(mem.exists());
         fs::remove_dir_all(dir).unwrap();
     }
 

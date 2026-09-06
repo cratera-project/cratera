@@ -40,6 +40,7 @@ ExecStart=/opt/cratera/cratera serve
 # Process lifecycle and resource limits
 Restart=on-failure
 RestartSec=3
+TimeoutStopSec=15s
 LimitNOFILE=65536
 Delegate=yes
 KillMode=mixed
@@ -67,6 +68,7 @@ WantedBy=multi-user.target
 | **`[Service]`** | `EnvironmentFile` | `-/opt/cratera/.env` | Loads optional operator environment overrides. The leading `-` prevents service failure if `.env` is absent. |
 | **`[Service]`** | `Restart` | `on-failure` | Automatically resurrects the service if the coordinator process terminates unexpectedly. |
 | **`[Service]`** | `RestartSec` | `3` | Imposes a 3-second delay before restarting to prevent rapid restart loops during hardware faults. |
+| **`[Service]`** | `TimeoutStopSec` | `15s` | Gives graceful shutdown time to cancel and reap active VM jobs before systemd's `KillMode=mixed` fallback. |
 | **`[Service]`** | `LimitNOFILE` | `65536` | Raises file descriptor limits for configurable concurrent microVM execution (epoll pipes, vsock descriptors, disk handles). |
 | **`[Service]`** | `Delegate` | `yes` | **Critical for cgroups v2**: Grants Cratera authority over its own cgroup sub-hierarchy (`/sys/fs/cgroup/system.slice/cratera.service/...`) to enforce per-microVM CPU and memory budgets. |
 | **`[Service]`** | `KillMode` | `mixed` | Sends `SIGTERM` to the main coordinator process on stop/restart, then sends `SIGKILL` to any lingering microVM child processes. |

@@ -3,6 +3,7 @@ use nix::mount::{MsFlags, mount};
 use nix::sys::reboot::{RebootMode, reboot};
 use std::fs::{self, File};
 use std::io::{self, Read};
+use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
@@ -290,6 +291,50 @@ fn pidfd_kill(fd: i32, sig: i32) {
     };
 }
 
+/// Put the command and all of its ordinary descendants in a job-specific
+/// process group.  The guest agent is PID 1, so this also gives it a chance to
+/// reap descendants whose original parent exits before the job is complete.
+fn kill_process_group(pid: u32) -> io::Result<()> {
+    let result = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+    if result == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(err)
+    }
+}
+
+fn reap_children_for(timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut reaped = false;
+        loop {
+            let result = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+            if result > 0 {
+                reaped = true;
+                continue;
+            }
+            if result == 0 {
+                break;
+            }
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return;
+        }
+        if Instant::now() >= deadline {
+            return;
+        }
+        if !reaped {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
 fn wait_for_pidfd(fd: i32, timeout: Duration) -> io::Result<bool> {
     let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
     let mut pollfd = libc::pollfd {
@@ -327,18 +372,26 @@ fn run_cmd(mut cmd: Command, timeout: Duration, sample_rss: bool) -> CmdOut {
         Err(e) => return failed(e.to_string(), false, 0, 0),
     };
 
-    let mut child = match cmd
-        .env_clear()
-        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-        .env("HOME", "/tmp")
-        .env("TMPDIR", "/tmp")
-        .env("XDG_CACHE_HOME", "/tmp/.cache")
-        .env("XDG_CONFIG_HOME", "/tmp/.config")
-        .env("XDG_DATA_HOME", "/tmp/.local/share")
-        .current_dir("/tmp")
-        .stdout(Stdio::from(stdout_file))
-        .stderr(Stdio::from(stderr_file))
-        .spawn()
+    // setpgid runs before exec
+    let mut child = match unsafe {
+        cmd.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        })
+    }
+    .env_clear()
+    .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+    .env("HOME", "/tmp")
+    .env("TMPDIR", "/tmp")
+    .env("XDG_CACHE_HOME", "/tmp/.cache")
+    .env("XDG_CONFIG_HOME", "/tmp/.config")
+    .env("XDG_DATA_HOME", "/tmp/.local/share")
+    .current_dir("/tmp")
+    .stdout(Stdio::from(stdout_file))
+    .stderr(Stdio::from(stderr_file))
+    .spawn()
     {
         Ok(c) => c,
         Err(e) => return failed(e.to_string(), false, 0, 0),
@@ -389,11 +442,8 @@ fn run_cmd(mut cmd: Command, timeout: Duration, sample_rss: bool) -> CmdOut {
             if claim_timeout(&command_state) {
                 if let Some(fd) = pidfd {
                     pidfd_kill(fd, libc::SIGKILL);
-                } else {
-                    unsafe {
-                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
-                    }
                 }
+                let _ = kill_process_group(pid);
             }
         });
         false
@@ -417,6 +467,10 @@ fn run_cmd(mut cmd: Command, timeout: Duration, sample_rss: bool) -> CmdOut {
         finish_command(&command_state)
     };
     finished.store(true, Ordering::SeqCst);
+    // A command may have exited while leaving background children behind.
+    // Clean the group on every path
+    let cleanup_error = kill_process_group(pid).err();
+    reap_children_for(Duration::from_millis(100));
     let elapsed_us = start.elapsed().as_micros() as u64;
 
     if let Some(fd) = pidfd {
@@ -434,7 +488,23 @@ fn run_cmd(mut cmd: Command, timeout: Duration, sample_rss: bool) -> CmdOut {
                 0
             };
             if timed_out {
-                return failed(read_cap(stderr_path), true, memory_kb, elapsed_us);
+                let stderr = read_cap(stderr_path);
+                return failed(
+                    cleanup_error
+                        .map(|cleanup| format!("{stderr}\nprocess cleanup: {cleanup}"))
+                        .unwrap_or(stderr),
+                    true,
+                    memory_kb,
+                    elapsed_us,
+                );
+            }
+            if let Some(cleanup) = cleanup_error {
+                return failed(
+                    format!("process cleanup: {cleanup}"),
+                    false,
+                    memory_kb,
+                    elapsed_us,
+                );
             }
             CmdOut::Done {
                 status,
@@ -447,7 +517,14 @@ fn run_cmd(mut cmd: Command, timeout: Duration, sample_rss: bool) -> CmdOut {
         Err(e) => {
             let _ = child.kill();
             let _ = child.wait();
-            failed(e.to_string(), false, 0, elapsed_us)
+            failed(
+                cleanup_error
+                    .map(|cleanup| format!("{e}; process cleanup: {cleanup}"))
+                    .unwrap_or_else(|| e.to_string()),
+                false,
+                0,
+                elapsed_us,
+            )
         }
     }
 }
@@ -503,8 +580,14 @@ fn halt() -> ! {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandState, claim_timeout, finish_command, measured_rss_kb, parse_status_kb};
+    use super::{
+        CmdOut, CommandState, build_command, claim_timeout, finish_command, measured_rss_kb,
+        parse_status_kb, run_cmd,
+    };
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::Mutex;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn parses_rss_anon_not_file_rss() {
@@ -531,5 +614,73 @@ mod tests {
         assert!(claim_timeout(&state));
         assert!(finish_command(&state));
         assert_eq!(*state.lock().unwrap(), CommandState::TimedOut);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn marker_path(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "cratera-agent-{label}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_gone(pid: u32) {
+        for _ in 0..100 {
+            let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+            if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        panic!("descendant process {pid} survived job cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn timeout_kills_background_descendant() {
+        let marker = marker_path("timeout");
+        let command = format!(
+            "sleep 30 & child=$!; echo $child > {}; wait",
+            marker.display()
+        );
+        let out = run_cmd(
+            build_command(&["/bin/sh".into(), "-c".into(), command]),
+            Duration::from_millis(50),
+            false,
+        );
+        let child_pid: u32 = fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
+        assert!(matches!(
+            out,
+            CmdOut::Failed {
+                timed_out: true,
+                ..
+            }
+        ));
+        assert_gone(child_pid);
+        let _ = fs::remove_file(marker);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn normal_parent_exit_kills_background_descendant() {
+        let marker = marker_path("normal");
+        let command = format!(
+            "sleep 30 & child=$!; echo $child > {}; exit 0",
+            marker.display()
+        );
+        let out = run_cmd(
+            build_command(&["/bin/sh".into(), "-c".into(), command]),
+            Duration::from_secs(2),
+            false,
+        );
+        let child_pid: u32 = fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
+        assert!(matches!(out, CmdOut::Done { status, .. } if status.success()));
+        assert_gone(child_pid);
+        let _ = fs::remove_file(marker);
     }
 }

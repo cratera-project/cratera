@@ -242,6 +242,7 @@ pub async fn start_server() -> anyhow::Result<()> {
         submit_timeout_ms: submit_ms,
         max_time_ms,
     });
+    let shutdown_executor = state.executor.clone();
 
     let app = Router::new()
         .route(
@@ -259,8 +260,33 @@ pub async fn start_server() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!(%addr, "cratera listening");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            shutdown_executor.shutdown();
+            info!("shutdown signal received; stopping active jobs");
+        })
+        .await?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let ctrl_c = tokio::signal::ctrl_c();
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = terminate.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 pub async fn harness(
